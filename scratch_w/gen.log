@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "d:/cloud_computing_game/tools/build_world.py", line 10, in <module>
+    import autotile as AT
+  File "D:/cloud_computing_game/tools/autotile.py", line 4, in <module>
+    from PIL import Image
+ModuleNotFoundError: No module named 'PIL'

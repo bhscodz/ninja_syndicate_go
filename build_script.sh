@@ -2,10 +2,8 @@
 
 set -euo pipefail
 
-# Go to the project root.
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-# Check required tools.
 for tool in cmake ninja g++; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "Error: $tool is not installed or not in PATH."
@@ -13,13 +11,16 @@ for tool in cmake ninja g++; do
     fi
 done
 
-# Configure the project.
-cmake -S . -B build -G Ninja \
-    -DCMAKE_BUILD_TYPE=Debug
-
-# Compile and link the project.
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build --parallel
 
-echo "Build completed successfully."
-echo "Executable: build/bin/sfml_app.exe"
-echo "use run the compiled code from build/bin/sfml_app.exe"
+echo
+echo "Build complete."
+echo "  Server: build/bin/game_server.exe [port]"
+echo "  Client: build/bin/game_client.exe [host] [port] [name]"
+echo
+echo "Quick start (one terminal each):"
+echo "  ./build/bin/game_server.exe"
+echo "  ./build/bin/game_client.exe 127.0.0.1 7777 You"
+echo
+echo "Empty player slots are filled by bots, so a single client is playable."
