@@ -32,6 +32,7 @@ public:
         if (inited_) return;
         inited_ = true;
         debug_ = std::getenv("SOUND_DEBUG") != nullptr;
+        muted_ = std::getenv("GAME_MUTE") != nullptr;   // silent start (screenshots / testing)
         dir_ = root;
         if (!dir_.empty() && dir_.back() != '/' && dir_.back() != '\\') dir_ += '/';
         std::string a = dir_ + "Audio/";
