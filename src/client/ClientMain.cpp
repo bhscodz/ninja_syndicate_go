@@ -1,4 +1,4 @@
-// Client for the steal-the-treasure multiplayer game.
+// Client for the ninja_syndicate_go multiplayer game.
 //
 // Connects to the authoritative server, renders the shared map with four
 // corner bases, drives the local player from the keyboard, and shows the
@@ -194,7 +194,7 @@ int main(int argc, char** argv) {
     Sound::get().init(root);
     Sound::get().startMusic();
 
-    sf::RenderWindow window(sf::VideoMode({1280, 960}), "Steal the Treasure");
+    sf::RenderWindow window(sf::VideoMode({1280, 960}), "ninja_syndicate_go");
     window.setFramerateLimit(60);
 
     // ---- landing page / lobby (src/client/Menu.hpp) ----

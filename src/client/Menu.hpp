@@ -466,8 +466,8 @@ private:
     }
 
     void title(sf::RenderTarget& rt, float y, unsigned sz) {
-        text(rt, "STEAL THE TREASURE", sz, sf::Color(255, 226, 110), { W * 0.5f, y }, 1, sz >= 60 ? 6.f : 4.f, sz * 2 / 5);
-        sf::Text meas(*font_, ui::spaced("STEAL THE TREASURE", sz * 2 / 5), sz);
+        text(rt, "NINJA SYNDICATE GO", sz, sf::Color(255, 226, 110), { W * 0.5f, y }, 1, sz >= 60 ? 6.f : 4.f, sz * 2 / 5);
+        sf::Text meas(*font_, ui::spaced("NINJA SYNDICATE GO", sz * 2 / 5), sz);
         float tw = meas.getLocalBounds().size.x * 0.5f + sz * 1.3f;
         float sc = sz / 14.f;
         treasureAt(rt, { W * 0.5f - tw, y }, sc, 0.f);

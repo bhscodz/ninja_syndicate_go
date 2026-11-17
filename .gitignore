@@ -7,3 +7,4 @@ known_hosts
 scratch_w/*
 steal-server.tar.gz
 deploy/*
+release/*

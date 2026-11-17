@@ -12,12 +12,12 @@ if not exist build\bin\game_server.exe (
     exit /b 1
   )
 )
-tasklist /v /fi "imagename eq game_server.exe" 2>nul | findstr /c:"StealTreasure Server :%PORT%" >nul && (
+tasklist /v /fi "imagename eq game_server.exe" 2>nul | findstr /c:"ninja_syndicate_go Server :%PORT%" >nul && (
   echo Server already running on port %PORT%.
   exit /b 1
 )
-start "StealTreasure Server :%PORT%" /min build\bin\game_server.exe %PORT%
-echo Server started (window "StealTreasure Server :%PORT%", minimized) on port %PORT%.
+start "ninja_syndicate_go Server :%PORT%" /min build\bin\game_server.exe %PORT%
+echo Server started (window "ninja_syndicate_go Server :%PORT%", minimized) on port %PORT%.
 echo.
 echo Friends on your LAN can join with one of:
 for /f "tokens=2 delims=:" %%a in ('ipconfig ^| findstr /c:"IPv4"') do (

@@ -1,4 +1,4 @@
-// Shared gameplay constants for the steal-the-treasure multiplayer game.
+// Shared gameplay constants for the ninja_syndicate_go multiplayer game.
 #pragma once
 #include <cstdint>
 
@@ -28,7 +28,7 @@ constexpr float MATCH_TIME = 180.f; // seconds per round
 
 // --- Network ---
 constexpr unsigned short SERVER_PORT = 7777;
-constexpr const char*     DEFAULT_HOST = "127.0.0.1";
+constexpr const char*     DEFAULT_HOST = "13.236.233.60";   // public game server (AWS Elastic IP)
 constexpr float SNAP_INTERVAL = 1.f / 30.f; // server snapshot rate
 
 // --- Character sheet layout (matches Ninja Adventure sprite sheets) ---

@@ -1,4 +1,4 @@
-# Steal the Treasure — a 4-player SFML arena
+# ninja_syndicate_go — a 4-player SFML arena
 
 A single-map multiplayer game where each of four players guards a treasure in
 their corner base and tries to steal the treasures from the other three bases.
@@ -89,7 +89,7 @@ Windows (`.bat`; `.ps1` wrappers and POSIX `.sh` equivalents also exist):
 
 | Script | Purpose |
 | --- | --- |
-| `start_server.bat [port]` | Builds if needed, starts the server minimized in a window titled `StealTreasure Server :<port>` and prints your LAN `ip:port` addresses to share (default port 7777). |
+| `start_server.bat [port]` | Builds if needed, starts the server minimized in a window titled `ninja_syndicate_go Server :<port>` and prints your LAN `ip:port` addresses to share (default port 7777). |
 | `stop_server.bat [port]` | Stops only the server started by `start_server.bat` on that port. `stop_server.bat all` kills every `game_server.exe`. |
 | `start_client.bat [host] [port] [name]` | Launches the client (defaults `127.0.0.1 7777 Player`). |
 

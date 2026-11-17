@@ -1,4 +1,4 @@
-// Authoritative game server for the steal-the-treasure multiplayer game.
+// Authoritative game server for the ninja_syndicate_go multiplayer game.
 //
 // Responsibilities:
 //   - Host many independent ROOMS (up to 4 players each, own lobby/match/chat).
@@ -523,7 +523,7 @@ int main(int argc, char** argv) {
 
     std::vector<std::unique_ptr<Conn>> conns;
 
-    std::cout << "Steal-the-Treasure server running on port " << port
+    std::cout << "ninja_syndicate_go server running on port " << port
               << " (rooms of up to " << gc::NUM_PLAYERS << " players).\n"
               << "Server key fingerprint: " << sec::fingerprint(g_identity.pub)
               << (created ? "  (new key generated)" : "") << "\n"
