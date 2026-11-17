@@ -220,7 +220,7 @@ struct Net {
         if (!connected) return;
         std::lock_guard<std::mutex> lk(mtx);
         sf::Packet p;
-        p << static_cast<uint32_t>(Msg::C2S_Input) << in.dirX << in.dirY << in.facing << in.shoot;
+        p << static_cast<uint32_t>(Msg::C2S_Input) << in.dirX << in.dirY << in.facing << in.shoot << in.leap;
         sendRaw(p);
     }
     void sendChat(const std::string& text) {
@@ -274,7 +274,7 @@ struct Net {
         std::vector<ChatLine> out; out.swap(chatQueue); return out;
     }
 
-    ~Net() { cancelConnect(); dropLink(); }
+    ~Net() { cancelConnect(); if (connected) sendSimple(Msg::C2S_Leave); dropLink(); }
 
 private:
     std::shared_ptr<ConnectJob> job_;

@@ -31,7 +31,7 @@
 
 namespace sec {
 
-constexpr uint32_t MAGIC = 0x53545431;      // "STT1"
+constexpr uint32_t MAGIC = 0x53545432;      // "STT2" (protocol v2: leap, treasure states)
 constexpr size_t   KEY_LEN = 32, TAG_LEN = 16;
 constexpr size_t   MAX_PLAIN = 4096;         // largest accepted plaintext packet
 constexpr size_t   MAX_WIRE = MAX_PLAIN + TAG_LEN;

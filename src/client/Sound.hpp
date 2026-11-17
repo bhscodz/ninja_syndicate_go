@@ -18,7 +18,8 @@
 
 enum class SfxId {
     Shoot, Hit, Teleport, Pickup, Deliver, Win, Lose, Join, Chat, Step, Empty,
-    UiClick, UiHover, UiBack, Count
+    UiClick, UiHover, UiBack, ChatPop, Whisper,
+    Alarm, Drop, Recover, Return, Leap, Land, Secret, Count
 };
 
 class Sound {
@@ -45,11 +46,20 @@ public:
         set(SfxId::Lose,     a + "Jingles/GameOver.wav");
         set(SfxId::Join,     s + "Menu/Menu10.wav");
         set(SfxId::Chat,     s + "Alert/Alert.wav");
+        set(SfxId::ChatPop,  s + "Menu/Accept5.wav");    // short bright "pop": a message from a teammate
+        set(SfxId::Whisper,  s + "Alert/Alert2.wav");    // slightly longer two-tone alert: a private message
         set(SfxId::Step,     s + "Elemental/Grass.wav");
         set(SfxId::Empty,    s + "Menu/Cancel.wav");
         set(SfxId::UiClick,  s + "Menu/Menu5.wav");
         set(SfxId::UiHover,  s + "Menu/Move1.wav");
         set(SfxId::UiBack,   s + "Menu/Cancel.wav");
+        set(SfxId::Alarm,    s + "Alert/Alert3.wav");            // a trophy was stolen (global)
+        set(SfxId::Drop,     s + "Alert/Alert5.wav");
+        set(SfxId::Recover,  s + "Bonus/PowerUp2.wav");
+        set(SfxId::Return,   s + "Magic & Skill/Heal.wav");
+        set(SfxId::Leap,     s + "Jump & Bounce/Jump.wav");
+        set(SfxId::Land,     s + "Jump & Bounce/Bounce3.wav");
+        set(SfxId::Secret,   s + "Bonus/Bonus3.wav");
         sfxOk_ = true;
         if (debug_) std::cerr << "[sound] init root=" << dir_ << " audio=" << (sfxOk_ ? "yes" : "no") << "\n";
     }
@@ -61,7 +71,7 @@ public:
         if (!inited_ || !sfxOk_) return;
         const std::string M = "Audio/Musics/", X = "Audio/MusicExtra/";
         calmList_  = { X + "Sneaky Snitch.mp3", M + "31 - Sunny.ogg", X + "Pixelland.mp3", M + "35 - Adventure.ogg",
-                       X + "Fluffing a Duck.mp3", M + "20 - Good Time.ogg", X + "Carefree.mp3", M + "23 - Road.ogg",
+                       M + "20 - Good Time.ogg", X + "Carefree.mp3", M + "23 - Road.ogg",
                        X + "Monkeys Spinning Monkeys.mp3", M + "36 - Village.ogg", X + "Wallpaper.mp3", M + "27 - Chill.ogg" };
         chaseList_ = { X + "Black Vortex.mp3", X + "Hot Pursuit.mp3", X + "Volatile Reaction.mp3",
                        X + "Prelude and Action.mp3", M + "28 - Tension.ogg", M + "17 - Fight.ogg" };
@@ -185,7 +195,8 @@ private:
     }
     static const char* name(SfxId id) {
         static const char* n[] = {"Shoot","Hit","Teleport","Pickup","Deliver","Win","Lose","Join","Chat","Step",
-                                  "Empty","UiClick","UiHover","UiBack"};
+                                  "Empty","UiClick","UiHover","UiBack","ChatPop","Whisper",
+                                  "Alarm","Drop","Recover","Return","Leap","Land","Secret"};
         return n[(int)id];
     }
 

@@ -10,10 +10,12 @@
 #include "../game/Protocol.hpp"
 #include "UiTheme.hpp"
 #include "Menu.hpp"
+#include "NetClient.hpp"
 #include "Sound.hpp"
 #include "Fog.hpp"
 #include "Sky.hpp"
 #include "Weather.hpp"
+#include "Trophy.hpp"
 
 #include <SFML/Graphics.hpp>
 #include <SFML/Network.hpp>
@@ -27,6 +29,8 @@
 #include <deque>
 #include <iostream>
 #include <mutex>
+#include <queue>
+#include <utility>
 #include <string>
 #include <thread>
 #include <vector>
@@ -59,6 +63,8 @@ struct Assets {
     sf::Texture flags[4];                   // animated team flags
     sf::Texture chars[4];
     sf::Font font;
+    sf::Font chatFont;                      // plain system font for chat text (readable), pixel font stays for the rest
+    bool chatFontOk = false;
     bool fontOk = false;
 
     bool loadAll(const std::string& root) {
@@ -94,6 +100,9 @@ struct Assets {
             t->setSmooth(false);
         fontOk = font.openFromFile(root + "Ui/Font/NormalFont.ttf");
         if (!fontOk) fontOk = font.openFromFile("C:/Windows/Fonts/arial.ttf");
+        for (const char* f : { "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/verdana.ttf",
+                               "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/System/Library/Fonts/Helvetica.ttc" })
+            if (!chatFontOk) chatFontOk = chatFont.openFromFile(f);
         return true;
     }
 };
@@ -115,132 +124,7 @@ std::string findAssetRoot() {
     return "Ninja Adventure - Asset Pack/";
 }
 
-// ----- Network core --------------------------------------------------------
-struct Net {
-    sf::TcpSocket socket;
-    std::mutex mtx;
-    Snapshot snap;
-    bool hasSnap = false;
-    uint8_t myId = 255;
-    std::string roomCode;
-    LobbyInfo lobby;
-    std::string errText;          // set when the server rejects us (room full / not found / ...)
-    bool matchStarted = false;
-    std::atomic<bool> running{ false };
-    std::atomic<bool> connected{ false };
-    std::thread thr;
-    std::vector<GameEvent> evQueue;
-    std::vector<ChatLine> chatQueue;
-
-    // Connects and sends the Hello (create a room, or join `code`). Welcome/Error arrive asynchronously.
-    bool connect(const std::string& host, unsigned short port, const std::string& name,
-                 JoinMode mode, const std::string& code) {
-        disconnect();
-        auto addrOpt = sf::IpAddress::resolve(host);
-        if (!addrOpt) return false;
-        socket.setBlocking(true);
-        auto st = socket.connect(*addrOpt, port, sf::seconds(3));
-        if (st != sf::Socket::Status::Done) return false;
-        socket.setBlocking(false);
-        connected = true;
-        running = true;
-        {
-            std::lock_guard<std::mutex> lk(mtx);
-            sf::Packet p; p << static_cast<uint32_t>(Msg::C2S_Join) << name << static_cast<uint8_t>(mode) << code;
-            socket.send(p);
-        }
-        thr = std::thread([this] { recvLoop(); });
-        return true;
-    }
-
-    // Closes the connection and forgets all room/match state.
-    void disconnect() {
-        running = false;
-        if (thr.joinable()) thr.join();
-        std::lock_guard<std::mutex> lk(mtx);
-        socket.disconnect();
-        connected = false;
-        snap = Snapshot{}; hasSnap = false; myId = 255; roomCode.clear(); lobby = LobbyInfo{};
-        errText.clear(); matchStarted = false; evQueue.clear(); chatQueue.clear();
-    }
-
-    void sendInput(const ClientInput& in) {
-        if (!connected) return;
-        std::lock_guard<std::mutex> lk(mtx);
-        sf::Packet p;
-        p << static_cast<uint32_t>(Msg::C2S_Input) << in.dirX << in.dirY << in.facing << in.shoot;
-        socket.send(p);
-    }
-
-    void sendChat(const std::string& text) {
-        if (!connected) return;
-        std::lock_guard<std::mutex> lk(mtx);
-        sf::Packet p; p << static_cast<uint32_t>(Msg::C2S_Chat) << text;
-        socket.send(p);
-    }
-    void sendSimple(Msg m) {
-        if (!connected) return;
-        std::lock_guard<std::mutex> lk(mtx);
-        sf::Packet p; p << static_cast<uint32_t>(m);
-        socket.send(p);
-    }
-
-    Snapshot copySnap() {
-        std::lock_guard<std::mutex> lk(mtx);
-        return snap;
-    }
-    uint8_t copyId() { std::lock_guard<std::mutex> lk(mtx); return myId; }
-    bool hasSnapshot() { std::lock_guard<std::mutex> lk(mtx); return hasSnap; }
-    void roomState(std::string& code, LobbyInfo& li, std::string& err, bool& started) {
-        std::lock_guard<std::mutex> lk(mtx);
-        code = roomCode; li = lobby; err = errText; started = matchStarted;
-    }
-
-    std::vector<GameEvent> drainEvents() {
-        std::lock_guard<std::mutex> lk(mtx);
-        std::vector<GameEvent> out;
-        out.swap(evQueue);
-        return out;
-    }
-    std::vector<ChatLine> drainChat() {
-        std::lock_guard<std::mutex> lk(mtx);
-        std::vector<ChatLine> out;
-        out.swap(chatQueue);
-        return out;
-    }
-
-private:
-    void recvLoop() {
-        while (running) {
-            sf::Packet pkt;
-            bool got = false, disc = false;
-            {
-                std::lock_guard<std::mutex> lk(mtx);
-                auto st = socket.receive(pkt);
-                if (st == sf::Socket::Status::Done) { handle(pkt); got = true; }
-                else if (st == sf::Socket::Status::Disconnected || st == sf::Socket::Status::Error) { connected = false; disc = true; }
-            }
-            if (disc) return;
-            if (!got) sf::sleep(sf::milliseconds(5));
-        }
-    }
-
-    void handle(sf::Packet& pkt) {
-        uint32_t m; pkt >> m;
-        switch (static_cast<Msg>(m)) {
-            case Msg::S2C_Welcome: pkt >> myId >> roomCode; break;
-            case Msg::S2C_Lobby: pkt >> lobby; break;
-            case Msg::S2C_GameStart: matchStarted = true; break;
-            case Msg::S2C_Error: { uint8_t c; std::string t; pkt >> c >> t; errText = t.empty() ? "Server error" : t; break; }
-            case Msg::S2C_Snapshot: pkt >> snap; hasSnap = true; break;
-            case Msg::S2C_Chat: { ChatLine c; pkt >> c; chatQueue.push_back(c); break; }
-            case Msg::S2C_Event: { GameEvent e; pkt >> e; evQueue.push_back(e); break; }
-            default: break;
-        }
-    }
-public:
-    ~Net() { disconnect(); }
-};
+using netc::Net;   // network layer lives in NetClient.hpp (encrypted channel, reconnect, ping)
 
 void cfgText(sf::Text& t, const sf::Font& f, const std::string& s, unsigned sz, sf::Color fill, float thick = 0.f, sf::Color outline = sf::Color::Black) {
     t = sf::Text(f, ui::spaced(s, sz), sz);
@@ -262,10 +146,16 @@ std::string eventText(const Snapshot& s, const GameEvent& e) {
     switch (e.type) {
         case EvType::Teleport: return nm(e.a) + " was sent home by " + nm(e.b);
         case EvType::Steal:     return nm(e.a) + " stole " + nm(e.b) + "'s treasure";
+        case EvType::Drop:     return nm(e.a) + " dropped " + (e.c < gc::NUM_PLAYERS ? nm(e.c) + "'s" : std::string("a")) + " treasure!";
+        case EvType::Recover:  return nm(e.a) + " recovered their treasure";
+        case EvType::Returned: return (e.c < gc::NUM_PLAYERS ? nm(e.c) + "'s" : std::string("A")) + " treasure flew home";
+        case EvType::Secret:   return {};   // discovery toast is generated locally
         case EvType::Deliver:  return nm(e.a) + " delivered a treasure!";
         case EvType::Join:     return nm(e.a) + " joined the hunt";
         case EvType::Leave:    return nm(e.a) + " left";
-        case EvType::GameOver: return e.a == 255 ? "Draw! Next round soon..." : (nm(e.a) + " wins! Next round soon...");
+        case EvType::Lost:     return nm(e.a) + " lost connection";
+        case EvType::Reconnected: return nm(e.a) + " reconnected";
+        case EvType::GameOver: return e.a == 255 ? "Draw! Back to the lobby soon..." : (nm(e.a) + " wins! Back to the lobby soon...");
         default: return {};
     }
 }
@@ -289,6 +179,11 @@ int main(int argc, char** argv) {
         }
     }
 
+    {   // known_hosts (pinned server keys) lives next to the executable
+        std::string a0 = argc > 0 ? argv[0] : "";
+        size_t sl = a0.find_last_of("/\\");
+        netc::dataDir() = sl == std::string::npos ? std::string() : a0.substr(0, sl + 1);
+    }
     std::string root = findAssetRoot();
     Assets assets;
     if (!assets.loadAll(root)) {
@@ -323,6 +218,8 @@ int main(int argc, char** argv) {
     int autoStart = std::getenv("GAME_AUTO_START") ? std::atoi(std::getenv("GAME_AUTO_START")) : 0;
     float menuClock = 0.f, waitClock = 0.f;
     bool pendingConnect = false, menuShotDone = false;
+    bool autoTrustDone = false, autoSettingsDone = false, autoDropDone = false, autoGameChatDone = false;
+    bool reconnecting = false, reconnAwait = false; int reconnAttempt = 0, reconnWelcomes = 0; float reconnLeft = 0.f, reconnNext = 0.f;
     menu::Action pendingAct;
     bool leavePrompt = false, escWas = false, yWas = false, nWas = false, enterWas = false;
 
@@ -336,6 +233,7 @@ int main(int argc, char** argv) {
     weather::Weather weatherFx;            // rain / water animation / leaves (src/client/Weather.hpp); F2 toggles, GAME_WEATHER=rain|clear forces
     weatherFx.init(root, &assets.waterRipple);
     float lastMatchTime = 0.f;
+    bool fogAllRevealed = false;
     sf::View hudView({640.f, 480.f}, {1280.f, 960.f});
 
     // interpolation state for remote players
@@ -353,9 +251,13 @@ int main(int argc, char** argv) {
     bool chatSkipText = false;
     std::string chatInput;
     int lastFacing = gc::FACE_DOWN;
-    bool spaceDown = false;
+    bool spaceDown = false, leapDown = false;
+    struct Spark { sf::Vector2f p, v; float age = 0.f; sf::Color col; };
+    std::vector<Spark> sparks;                       // secret-discovery sparkle burst (world space)
+    std::array<sf::Vector2f, gc::NUM_PLAYERS> lastDropPos{};   // where each trophy last lay on the ground (for the flight home)
 
-    sf::Clock clock;
+    sf::Clock clock;        // per-frame delta (restarted every frame)
+    sf::Clock worldClock;   // monotonic animation time: rain, flags, water, shadows (never restarted)
     while (window.isOpen()) {
         float dt = std::min(clock.restart().asSeconds(), 0.05f);
         Sound::get().tick(dt);   // music playlist + chase crossfade (also runs in the menus)
@@ -363,32 +265,64 @@ int main(int argc, char** argv) {
         // ================= menu (landing / join / lobby) =================
         if (appMode == AppMode::Menu) {
             menuClock += dt;
+            // connect worker finished?
+            auto cres = net.pollConnect();
+            if (cres == netc::ConnectResult::Failed) {
+                if (net.failKeyChanged) {
+                    menuUi.keyWarn.active = true; menuUi.keyWarn.host = pendingAct.host; menuUi.keyWarn.port = pendingAct.port;
+                    menuUi.keyWarn.newFp = net.failNewFp; menuUi.keyWarn.oldFp = net.failOldFp;
+                    menuUi.fail("");
+                } else menuUi.fail(net.failErr);
+            }
             std::string rc, err; LobbyInfo li; bool started = false;
             net.roomState(rc, li, err, started);
             menu::View nv; nv.connected = net.connected; nv.code = rc; nv.myId = net.copyId(); nv.lobby = li;
             // server-side results
             if (!err.empty()) { net.disconnect(); menuUi.fail(err); }
             else if (menuUi.busy && !rc.empty()) menuUi.enterLobby();
-            else if (menuUi.busy && !pendingConnect && waitClock > 4.f) { net.disconnect(); menuUi.fail("Server did not answer"); }
+            else if (menuUi.busy && !net.connecting() && waitClock > 6.f) { net.disconnect(); menuUi.fail("Server did not answer"); }
             else if (menuUi.screen == menu::Menu::Screen::Lobby && !net.connected) { net.disconnect(); menuUi.fail("Disconnected from server"); }
             if (menuUi.busy) waitClock += dt; else waitClock = 0.f;
             if (started && menuUi.screen == menu::Menu::Screen::Lobby) {
                 appMode = AppMode::Game;
-                uiClock.restart(); shotDone = false;
+                uiClock.restart(); shotDone = false; autoDropDone = false; autoGameChatDone = false;
+                chatLines.clear();
                 continue;
             }
             // automation
+            if (std::getenv("GAME_AUTO_TRUST") && menuUi.keyWarn.active && !autoTrustDone && menuUi.screenTime > 2.f) { autoTrustDone = true; menuUi.request(menu::Action::TrustKey); }
             if (!autoDone && menuClock > 0.7f && !menuUi.busy && menuUi.screen != menu::Menu::Screen::Lobby && !autoMode.empty()) {
                 autoDone = true;
                 if (autoMode == "create") menuUi.request(menu::Action::Create);
                 else if (autoMode.rfind("join:", 0) == 0) menuUi.request(menu::Action::Join, autoMode.substr(5));
             }
             std::vector<ChatLine> newChat;
-            if (menuUi.screen == menu::Menu::Screen::Lobby) newChat = net.drainChat();
+            if (menuUi.screen == menu::Menu::Screen::Lobby) {
+                newChat = net.drainChat();
+                const uint8_t me = net.copyId();
+                for (auto& c : newChat) {   // popup sound in the lobby too
+                    if (c.kind == CHAT_WHISPER_FROM) Sound::get().play(SfxId::Whisper, 1.0f);
+                    else if (c.kind == CHAT_NORMAL && c.fromId != me) Sound::get().play(SfxId::ChatPop, 1.0f);
+                }
+            }
             else net.drainChat();
             if (menuUi.screen == menu::Menu::Screen::Lobby) {
-                if (!autoChatDone && std::getenv("GAME_AUTO_CHAT") && menuUi.screenTime > 1.f) {
+                if (!autoChatDone && std::getenv("GAME_AUTO_CHAT") && menuUi.screenTime > (std::getenv("GAME_AUTO_CHAT_AT") ? (float)std::atof(std::getenv("GAME_AUTO_CHAT_AT")) : 1.f)) {
                     autoChatDone = true; net.sendChat(std::getenv("GAME_AUTO_CHAT"));
+                }
+                if (!autoSettingsDone && std::getenv("GAME_AUTO_SETTINGS") && nv.myId == li.hostId && menuUi.screenTime > 1.5f) {
+                    autoSettingsDone = true;   // e.g. "m=5,w=2,fog=0,cd=1"
+                    RoomSettings rs = li.settings;
+                    std::string spec = std::getenv("GAME_AUTO_SETTINGS");
+                    for (size_t pos = 0; pos < spec.size();) {
+                        size_t e = spec.find(',', pos); if (e == std::string::npos) e = spec.size();
+                        std::string kv = spec.substr(pos, e - pos); pos = e + 1;
+                        size_t eq = kv.find('='); if (eq == std::string::npos) continue;
+                        std::string k = kv.substr(0, eq); int v = std::atoi(kv.substr(eq + 1).c_str());
+                        if (k == "m") rs.minutes = (uint8_t)v; else if (k == "w") rs.winScore = (uint8_t)v;
+                        else if (k == "fog") rs.fog = v != 0; else if (k == "cd") rs.countdown = v != 0;
+                    }
+                    net.sendSettings(rs);
                 }
                 int n = 0; for (auto& sl : li.slots) if (sl.active) ++n;
                 if (autoStart > 0 && n >= autoStart && nv.myId == li.hostId && menuUi.screenTime > 6.f) {
@@ -396,21 +330,37 @@ int main(int argc, char** argv) {
                 }
             }
             menu::Action act = menuUi.frame(window, dt, nv, newChat);
+            auto startConnect = [&](bool trust) {
+                net.disconnect();
+                netc::ConnectParams cp;
+                cp.host = pendingAct.host; cp.port = pendingAct.port; cp.name = pendingAct.name; cp.code = pendingAct.code;
+                cp.mode = pendingAct.kind == menu::Action::Create ? JoinMode::Create : JoinMode::Join;
+                cp.trustNewKey = trust;
+                menuUi.busy = true;
+                net.beginConnect(cp);
+            };
             switch (act.kind) {
-                case menu::Action::Quit: window.close(); break;
+                case menu::Action::Quit: net.disconnect(); window.close(); break;
                 case menu::Action::Create:
-                case menu::Action::Join: pendingAct = act; pendingConnect = true; break;
+                case menu::Action::Join: pendingAct = act; startConnect(false); break;
+                case menu::Action::TrustKey: pendingAct.host = act.host; pendingAct.port = act.port; startConnect(true); break;
+                case menu::Action::Cancel: net.cancelConnect(); net.disconnect(); menuUi.busy = false; menuUi.error.clear(); break;
                 case menu::Action::Start: net.sendSimple(Msg::C2S_Start); break;
+                case menu::Action::CancelStart: net.sendSimple(Msg::C2S_StartCancel); break;
                 case menu::Action::Ready: net.sendSimple(Msg::C2S_Ready); break;
                 case menu::Action::Chat: net.sendChat(act.text); break;
+                case menu::Action::Settings: net.sendSettings(act.settings); break;
+                case menu::Action::Kick: net.sendKick(act.text); break;
                 case menu::Action::Leave: net.disconnect(); menuUi.fail("", true); break;
                 default: break;
             }
-            if (std::getenv("GAME_SHOT") && std::getenv("GAME_SHOT_ON") && !menuShotDone && menuUi.screenTime > 1.5f) {
+            if (std::getenv("GAME_SHOT") && std::getenv("GAME_SHOT_ON") && !menuShotDone && !menuUi.busy) {
                 std::string on = std::getenv("GAME_SHOT_ON");
                 auto sc = menuUi.screen;
-                bool match = (on == "landing" && sc == menu::Menu::Screen::Landing) || (on == "join" && sc == menu::Menu::Screen::Join) ||
-                             (on == "lobby" && sc == menu::Menu::Screen::Lobby && menuUi.screenTime > 3.5f);
+                float shotAt = std::getenv("GAME_SHOT_DELAY") ? (float)std::atof(std::getenv("GAME_SHOT_DELAY")) : (on == "lobby" ? 3.5f : 1.5f);
+                bool match = menuUi.screenTime > shotAt &&
+                             ((on == "landing" && sc == menu::Menu::Screen::Landing) || (on == "join" && sc == menu::Menu::Screen::Join) ||
+                              (on == "lobby" && sc == menu::Menu::Screen::Lobby));
                 if (match) {
                     sf::Texture shot(window.getSize()); shot.update(window);
                     (void)shot.copyToImage().saveToFile(std::getenv("GAME_SHOT"));
@@ -419,16 +369,10 @@ int main(int argc, char** argv) {
                 }
             }
             window.display();
-            if (pendingConnect && menuUi.busy) {   // connect after the "Connecting..." frame was shown
-                pendingConnect = false;
-                if (!net.connect(pendingAct.host, pendingAct.port, pendingAct.name,
-                                 pendingAct.kind == menu::Action::Create ? JoinMode::Create : JoinMode::Join, pendingAct.code))
-                    menuUi.fail("Could not connect to " + pendingAct.host + ":" + std::to_string(pendingAct.port));
-            } else pendingConnect = false;
             continue;
         }
 
-        // ---- in-game: lost connection -> back to landing; Esc asks to leave the match ----
+        // ---- in-game: server messages, reconnect, Esc asks to leave the match ----
         {
             bool esc = sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Escape);
             bool yk = sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Y);
@@ -438,17 +382,64 @@ int main(int argc, char** argv) {
             if (focusOk) {
                 if (!leavePrompt) { if (esc && !escWas && !chatActive) leavePrompt = true; }
                 else {
-                    if ((yk && !yWas) || (en && !enterWas)) { leavePrompt = false; net.disconnect(); menuUi.fail("", true); appMode = AppMode::Menu; escWas = esc; yWas = yk; enterWas = en; continue; }
+                    if ((yk && !yWas) || (en && !enterWas)) { leavePrompt = false; reconnecting = false; net.disconnect(); menuUi.fail("", true); appMode = AppMode::Menu; escWas = esc; yWas = yk; enterWas = en; continue; }
                     if ((nk && !nWas) || (esc && !escWas)) leavePrompt = false;
                 }
             }
             escWas = esc; yWas = yk; nWas = nk; enterWas = en;
-            if (!net.connected) {
-                leavePrompt = false;
-                net.disconnect();
-                menuUi.fail("Disconnected from server", true);
-                appMode = AppMode::Menu;
+
+            // automation: simulate a network drop after N seconds in the match
+            if (!autoDropDone && std::getenv("GAME_AUTO_DROP") && uiClock.getElapsedTime().asSeconds() > (float)std::atof(std::getenv("GAME_AUTO_DROP"))) {
+                autoDropDone = true; net.dropLink();
+            }
+            if (!autoGameChatDone && std::getenv("GAME_AUTO_GAMECHAT") && uiClock.getElapsedTime().asSeconds() > 1.5f) {
+                autoGameChatDone = true; net.sendChat(std::getenv("GAME_AUTO_GAMECHAT"));
+            }
+
+            if (net.takeToLobby()) {   // match finished: the room is back in the lobby (rematch / change settings)
+                net.clearMatchStarted(); reconnecting = false; leavePrompt = false;
+                menuUi.enterLobby(); appMode = AppMode::Menu; menuUi.busy = false;
                 continue;
+            }
+            {
+                std::string rc2, err2; LobbyInfo li2; bool st2 = false;
+                net.roomState(rc2, li2, err2, st2);
+                if (!err2.empty()) {   // kicked / server shut down / session expired: no reconnect
+                    reconnecting = false; leavePrompt = false;
+                    net.disconnect(); menuUi.fail(err2, true); appMode = AppMode::Menu;
+                    continue;
+                }
+            }
+            if (!net.connected && !reconnecting && !net.connecting()) {
+                if (!net.canReconnect()) {
+                    leavePrompt = false; net.disconnect(); menuUi.fail("Disconnected from server", true); appMode = AppMode::Menu;
+                    continue;
+                }
+                reconnecting = true; reconnAttempt = 0; reconnLeft = 20.f; reconnNext = 0.f; reconnAwait = false;
+                reconnWelcomes = net.welcomeCount();
+                net.dropLink();
+            }
+            if (reconnecting) {
+                reconnLeft -= dt; reconnNext -= dt;
+                auto r = net.pollConnect();
+                if (r == netc::ConnectResult::Failed) { reconnNext = 1.5f; if (net.failKeyChanged) reconnLeft = 0.f; }
+                if (r == netc::ConnectResult::Ok) reconnAwait = true;
+                if (reconnAwait) {
+                    if (net.welcomeCount() > reconnWelcomes) { reconnecting = false; reconnAwait = false; toasts.push_back({ "Reconnected", 0.f, sf::Color(140, 235, 150) }); }
+                    else if (!net.connected) { reconnAwait = false; reconnNext = 1.5f; }
+                }
+                if (reconnecting && !reconnAwait && !net.connecting() && reconnNext <= 0.f && reconnLeft > 0.f) {
+                    ++reconnAttempt;
+                    netc::ConnectParams cp = net.last;
+                    std::string rcode; LobbyInfo lx; std::string ex; bool sx = false;
+                    net.roomState(rcode, lx, ex, sx);
+                    cp.mode = JoinMode::Rejoin; cp.code = rcode; cp.token = net.token; cp.trustNewKey = false;
+                    net.beginConnect(cp);
+                }
+                if (reconnecting && reconnLeft <= 0.f) {
+                    reconnecting = false; net.disconnect(); menuUi.fail("Could not reconnect to the server", true); appMode = AppMode::Menu;
+                    continue;
+                }
             }
         }
 
@@ -459,6 +450,7 @@ int main(int argc, char** argv) {
                 if (!chatActive) { // sound hotkeys: M mute, +/- or ] [ volume
                     using K = sf::Keyboard::Key;
                     float dv = 0.f; bool mt = false;
+                    if (k->code == K::F3) { bool on = weatherFx.toggleStorm(); toasts.push_back({ on ? "Storm over the whole map" : "Storms back to local cells", 0.f, sf::Color(200, 230, 255) }); }
                     if (k->code == K::F2) { weatherFx.toggle(); toasts.push_back({ weatherFx.enabled() ? "Weather: on" : "Weather: off", 0.f, sf::Color(200, 230, 255) }); }
                     if (k->code == K::M) mt = true;
                     else if (k->code == K::Equal || k->code == K::Add || k->code == K::RBracket) dv = 0.1f;
@@ -482,6 +474,11 @@ int main(int argc, char** argv) {
                     chatActive = true; chatInput.clear(); chatSkipText = true;   // T opens chat (swallow its own character)
                 } else if (chatActive && k->code == sf::Keyboard::Key::Backspace) {
                     if (!chatInput.empty()) chatInput.pop_back();
+                } else if (chatActive && k->code == sf::Keyboard::Key::Tab) {   // Tab-complete a player name after /w, /msg, /pm, /kick
+                    Snapshot ts = net.copySnap(); uint8_t me2 = net.copyId();
+                    std::vector<std::string> nms;
+                    for (int pi = 0; pi < gc::NUM_PLAYERS; ++pi) if (ts.players[pi].active && pi != me2) nms.push_back(ts.players[pi].name);
+                    menu::tabComplete(chatInput, nms);
                 }
             }
             if (chatActive) {
@@ -512,47 +509,91 @@ int main(int argc, char** argv) {
             bool space = sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Space);
             in.shoot = space && !spaceDown;
             spaceDown = space;
-        }
-        if (std::getenv("GAME_BOT") && net.hasSnapshot()) {   // QA autopilot: BFS to the nearest enemy treasure, shoot now and then
+            bool leapKey = sf::Keyboard::isKeyPressed(sf::Keyboard::Key::LShift) || sf::Keyboard::isKeyPressed(sf::Keyboard::Key::RShift) ||
+                           sf::Keyboard::isKeyPressed(sf::Keyboard::Key::J);
+            in.leap = leapKey && !leapDown && window.hasFocus();
+            leapDown = leapKey;
+        } else leapDown = true;   // typing: swallow the key, no edge when chat closes while it is held
+        if (std::getenv("GAME_BOT") && net.hasSnapshot()) {   // QA autopilot: shortest path (walk + leap edges) to the nearest enemy/dropped treasure, shoot now and then
             static float botShoot = 0.f;
             Snapshot bs = net.copySnap(); uint8_t me = net.copyId();
-            if (me < gc::NUM_PLAYERS && bs.players[me].active && !bs.gameOver) {
+            if (me < gc::NUM_PLAYERS && bs.players[me].active && !bs.gameOver && bs.players[me].leapPhase == 0) {
                 const auto& pl = bs.players[me];
                 float tx = bs.treasures[me].homeX, ty = bs.treasures[me].homeY;
                 if (!pl.carrying) {
                     float best = 1e18f;
                     for (int i = 0; i < gc::NUM_PLAYERS; ++i) {
-                        if (i == me || !bs.treasures[i].present) continue;
-                        float d = std::hypot(bs.treasures[i].x - pl.x, bs.treasures[i].y - pl.y);
-                        if (d < best) { best = d; tx = bs.treasures[i].x; ty = bs.treasures[i].y; }
+                        const auto& tt = bs.treasures[i];
+                        const bool dropped = tt.state == (uint8_t)TState::Dropped;
+                        const bool home = tt.state == (uint8_t)TState::AtHome && i != me;
+                        if (!dropped && !home) continue;   // dropped trophies (even mine: touching it recovers it) are chased too
+                        float d = std::hypot(tt.x - pl.x, tt.y - pl.y) - (dropped ? 60.f : 0.f);
+                        if (d < best) { best = d; tx = tt.x; ty = tt.y; }
                     }
                 }
-                int sx = (int)((pl.x + 8) / gc::TILE), sy = (int)((pl.y + 8) / gc::TILE);
-                int gx = (int)(tx / gc::TILE), gy = (int)(ty / gc::TILE);
-                static std::vector<int> prev; prev.assign(gc::MAP_W * gc::MAP_H, -2);
-                std::deque<int> q; prev[gy * gc::MAP_W + gx] = -1; q.push_back(gy * gc::MAP_W + gx);
-                while (!q.empty() && prev[sy * gc::MAP_W + sx] == -2) {   // search from the goal so prev[] points toward it
-                    int c = q.front(); q.pop_front(); int cx = c % gc::MAP_W, cy = c / gc::MAP_W;
-                    const int dxs[4] = {1,-1,0,0}, dys[4] = {0,0,1,-1};
-                    for (int k = 0; k < 4; ++k) {
+                const int W = gc::MAP_W, H = gc::MAP_H;
+                int sx = std::clamp((int)((pl.x + 8) / gc::TILE), 0, W - 1), sy = std::clamp((int)((pl.y + 8) / gc::TILE), 0, H - 1);
+                int gx = std::clamp((int)(tx / gc::TILE), 0, W - 1), gy = std::clamp((int)(ty / gc::TILE), 0, H - 1);
+                // Dijkstra from the goal: walking costs 1, a leap (fly over 1-3 water/low cells, land <= 3 tiles later) costs 3.
+                static std::vector<int> prev, dist; static std::vector<int8_t> jdir;   // jdir[c] >= 0: leaving c toward prev[c] is a leap in that direction
+                prev.assign(W * H, -2); dist.assign(W * H, 1 << 28); jdir.assign(W * H, -1);
+                using QE = std::pair<int, int>;
+                std::priority_queue<QE, std::vector<QE>, std::greater<QE>> pq;
+                dist[gy * W + gx] = 0; prev[gy * W + gx] = -1; pq.push({ 0, gy * W + gx });
+                const int dxs[4] = { 0, 0, -1, 1 }, dys[4] = { 1, -1, 0, 0 };   // gc::FACE_DOWN/UP/LEFT/RIGHT order
+                const int maxGap = pl.carrying ? 2 : 3;
+                while (!pq.empty()) {
+                    auto [dc, c] = pq.top(); pq.pop();
+                    if (dc > dist[c]) continue;
+                    if (c == sy * W + sx) break;
+                    int cx = c % W, cy = c / W;
+                    for (int k = 0; k < 4; ++k) {   // walking edges
                         int nx = cx + dxs[k], ny = cy + dys[k];
-                        if (nx < 0 || ny < 0 || nx >= gc::MAP_W || ny >= gc::MAP_H || gcmap::solidTile(nx, ny)) continue;
-                        if (prev[ny * gc::MAP_W + nx] != -2) continue;
-                        prev[ny * gc::MAP_W + nx] = c; q.push_back(ny * gc::MAP_W + nx);
+                        if (nx < 0 || ny < 0 || nx >= W || ny >= H || gcmap::solidTile(nx, ny)) continue;
+                        int n = ny * W + nx;
+                        if (dc + 1 < dist[n]) { dist[n] = dc + 1; prev[n] = c; jdir[n] = -1; pq.push({ dc + 1, n }); }
+                    }
+                    if (!gcmap::solidTile(cx, cy)) {   // reverse leap edges: take-off X = c - dir*(gap+1), flying over `gap` flyOver cells
+                        for (int k = 0; k < 4; ++k)
+                            for (int gap = 1; gap <= maxGap; ++gap) {
+                                bool ok = true;
+                                for (int j = 1; j <= gap && ok; ++j) ok = gcmap::flyOver(cx - dxs[k] * j, cy - dys[k] * j);
+                                int ox = cx - dxs[k] * (gap + 1), oy = cy - dys[k] * (gap + 1);
+                                if (!ok || ox < 0 || oy < 0 || ox >= W || oy >= H || gcmap::solidTile(ox, oy)) continue;
+                                int n = oy * W + ox;
+                                if (dc + 3 < dist[n]) { dist[n] = dc + 3; prev[n] = c; jdir[n] = (int8_t)k; pq.push({ dc + 3, n }); }
+                            }
                     }
                 }
-                int nxt = prev[sy * gc::MAP_W + sx];
+                int nxt = prev[sy * W + sx];
                 if (nxt >= 0) {
-                    float wx = (nxt % gc::MAP_W) * gc::TILE + 8.f, wy = (nxt / gc::MAP_W) * gc::TILE + 8.f;
+                    float wx = (nxt % W) * gc::TILE + 8.f, wy = (nxt / W) * gc::TILE + 8.f;
                     float ddx = wx - (pl.x + 8), ddy = wy - (pl.y + 8);
-                    in.dirX = std::abs(ddx) > 1.5f ? (ddx > 0 ? 1.f : -1.f) : 0.f;
-                    in.dirY = std::abs(ddy) > 1.5f ? (ddy > 0 ? 1.f : -1.f) : 0.f;
-                    if (in.dirX != 0 && in.dirY != 0) { if (std::abs(ddx) > std::abs(ddy)) in.dirY = 0; else in.dirX = 0; }
-                    in.facing = in.dirX < 0 ? gc::FACE_LEFT : in.dirX > 0 ? gc::FACE_RIGHT : in.dirY < 0 ? gc::FACE_UP : gc::FACE_DOWN;
-                    lastFacing = in.facing;
+                    const int jd = jdir[sy * W + sx];
+                    if (jd >= 0) {   // leap edge: centre on the take-off tile, face the gap, press leap when the cooldown is ready
+                        const float cxp = sx * gc::TILE + 8.f, cyp = sy * gc::TILE + 8.f;
+                        const float ex = cxp - (pl.x + 8), ey = cyp - (pl.y + 8);
+                        if (std::abs(ex) > 2.f || std::abs(ey) > 2.f) {
+                            in.dirX = std::abs(ex) > 1.5f ? (ex > 0 ? 1.f : -1.f) : 0.f;
+                            in.dirY = std::abs(ey) > 1.5f ? (ey > 0 ? 1.f : -1.f) : 0.f;
+                            if (in.dirX != 0 && in.dirY != 0) { if (std::abs(ex) > std::abs(ey)) in.dirY = 0; else in.dirX = 0; }
+                        } else {
+                            in.dirX = in.dirY = 0.f;
+                            in.facing = jd; lastFacing = jd;
+                            if (pl.leapCd == 0) in.leap = true;
+                        }
+                    } else {
+                        in.dirX = std::abs(ddx) > 1.5f ? (ddx > 0 ? 1.f : -1.f) : 0.f;
+                        in.dirY = std::abs(ddy) > 1.5f ? (ddy > 0 ? 1.f : -1.f) : 0.f;
+                        if (in.dirX != 0 && in.dirY != 0) { if (std::abs(ddx) > std::abs(ddy)) in.dirY = 0; else in.dirX = 0; }
+                    }
+                    if (in.dirX != 0 || in.dirY != 0) {
+                        in.facing = in.dirX < 0 ? gc::FACE_LEFT : in.dirX > 0 ? gc::FACE_RIGHT : in.dirY < 0 ? gc::FACE_UP : gc::FACE_DOWN;
+                        lastFacing = in.facing;
+                    }
                 }
                 botShoot -= dt;
-                if (botShoot <= 0.f) { in.shoot = !std::getenv("GAME_BOT_NOSHOOT"); botShoot = 1.5f; }
+                if (botShoot <= 0.f) { in.shoot = !pl.carrying && !std::getenv("GAME_BOT_NOSHOOT"); botShoot = 1.5f; }
             }
         }
         net.sendInput(in);
@@ -561,7 +602,9 @@ int main(int argc, char** argv) {
             uint8_t me = net.copyId();
             bool hasMe = me < gc::NUM_PLAYERS && ss.players[me].active;
             Sound::get().step(dt, hasMe && !chatActive && (in.dirX != 0 || in.dirY != 0));
-            Sound::get().setChase(hasMe && ss.players[me].carrying && !ss.gameOver);   // tense music while running with the trophy
+            bool anyCarried = false;   // tense music while ANYONE runs with a trophy (plus the old local-carrier rule)
+            for (auto& tt : ss.treasures) if (tt.state == (uint8_t)TState::Carried) anyCarried = true;
+            Sound::get().setChase(hasMe && (ss.players[me].carrying || anyCarried) && !ss.gameOver);
             if (in.shoot && hasMe && ss.players[me].ammo <= 0) Sound::get().play(SfxId::Empty);
         }
 
@@ -575,10 +618,15 @@ int main(int argc, char** argv) {
             ce.name = c.name.empty() ? std::string("P") + std::to_string(int(c.fromId)) : c.name;
             ce.text = c.text;
             ce.colorIndex = c.fromId < gc::NUM_PLAYERS ? (int)c.fromId : -1;
+            if (c.kind == CHAT_WHISPER_FROM) { ce.name = "[whisper from " + ce.name + "]"; ce.colorIndex = -2; }
+            else if (c.kind == CHAT_WHISPER_TO) { ce.name = "[to " + ce.name + "]"; ce.colorIndex = -2; }
+            else if (c.kind == CHAT_SYSTEM) { ce.name = "server"; ce.colorIndex = -3; }
             chatLines.push_back(ce);
-            if (c.fromId != myId) Sound::get().play(SfxId::Chat, 0.8f);
+            if (c.kind == CHAT_WHISPER_FROM) Sound::get().play(SfxId::Whisper, 1.0f);
+            else if (c.kind == CHAT_NORMAL && c.fromId != myId) Sound::get().play(SfxId::ChatPop, 1.0f);   // popup sound for teammates' messages
         }
         for (auto& cl : chatLines) cl.age += dt;
+        if (std::getenv("GAME_CHAT_OPEN") && !chatActive && chatInput.empty()) { chatActive = true; chatInput = "typing a message..."; }   // screenshot helper
         if (std::getenv("UI_FAKECHAT") && chatLines.empty()) {
             chatLines.push_back({"Ayaka", "hey, who has the red treasure?", 0, 0.f});
             chatLines.push_back({"Bot2", "me! heading home now", 1, 0.f});
@@ -597,7 +645,13 @@ int main(int argc, char** argv) {
                 switch (e.type) {
                     case EvType::Shoot:    snd.play(SfxId::Shoot, e.a == myId ? 1.f : av); break;
                     case EvType::Teleport: snd.play(SfxId::Hit); snd.play(SfxId::Teleport, 0.8f); break;
-                    case EvType::Steal:    snd.play(SfxId::Pickup); break;
+                    case EvType::Steal:    snd.play(SfxId::Pickup); snd.play(SfxId::Alarm); break;   // alarm is global
+                    case EvType::Drop:     snd.play(SfxId::Drop); break;
+                    case EvType::Recover:  snd.play(SfxId::Recover); break;
+                    case EvType::Returned: snd.play(SfxId::Return, 0.8f); break;
+                    case EvType::Leap:     snd.play(SfxId::Leap, e.a == myId ? 1.f : av); break;
+                    case EvType::Land:     snd.play(SfxId::Land, e.a == myId ? 1.f : av); break;
+                    case EvType::Secret:   if (e.a == myId) snd.play(SfxId::Secret); break;
                     case EvType::Deliver:  snd.play(SfxId::Deliver); break;
                     case EvType::Join:     if (e.a != myId) snd.play(SfxId::Join); break;
                     case EvType::GameOver: snd.play(e.a == myId ? SfxId::Win : SfxId::Lose); break;
@@ -608,6 +662,7 @@ int main(int argc, char** argv) {
             if (t.empty()) continue;
             sf::Color col = (e.a < gc::NUM_PLAYERS) ? TEAM_COLOR[e.a] : sf::Color::White;
             if (e.type == EvType::GameOver) col = sf::Color(255, 230, 120);
+            if (e.type == EvType::Returned && e.c < gc::NUM_PLAYERS) col = TEAM_COLOR[e.c];
             toasts.push_back({ t, 0.f, col });
         }
         for (auto& t : toasts) t.age += dt;
@@ -624,6 +679,28 @@ int main(int argc, char** argv) {
             float a = std::min(1.f, dt * 15.f);
             disp[i] += (target - disp[i]) * a;
         }
+
+        // trophy bookkeeping: remember where a trophy lay so the flight home can be drawn smoothly
+        for (int i = 0; i < gc::NUM_PLAYERS; ++i) {
+            const auto& t = s.treasures[i];
+            if (t.state == (uint8_t)TState::Dropped || t.state == (uint8_t)TState::Carried) lastDropPos[i] = { t.x, t.y };
+        }
+        // secret passage discovery: my tile carries a passage id I have not found yet (fog reset at match start clears it)
+        if (myId < gc::NUM_PLAYERS && s.players[myId].active && net.hasSnapshot()) {
+            const sf::Vector2f mc = disp[myId] + sf::Vector2f(8.f, 8.f);
+            const int sid = gcmap::secretAt((int)(mc.x / gc::TILE), (int)(mc.y / gc::TILE));
+            if (sid > 0 && fogOfWar.discover(sid)) {
+                toasts.push_back({ "Secret passage found!", 0.f, sf::Color(130, 255, 160) });
+                Sound::get().play(SfxId::Secret);
+                for (int k = 0; k < 18; ++k) {
+                    const float a = k * 0.3491f, sp = 25.f + (k % 5) * 9.f;
+                    sparks.push_back({ mc, { std::cos(a) * sp, std::sin(a) * sp - 10.f }, 0.f,
+                                       (k & 1) ? sf::Color(255, 240, 140) : sf::Color(140, 255, 170) });
+                }
+            }
+        }
+        for (auto& sp : sparks) { sp.age += dt; sp.p += sp.v * dt; sp.v.y += 30.f * dt; }
+        sparks.erase(std::remove_if(sparks.begin(), sparks.end(), [](const Spark& sp){ return sp.age > 0.9f; }), sparks.end());
 
         // ---- Update camera to follow local player ----
         if (myId != 255 && myId < gc::NUM_PLAYERS) {
@@ -656,12 +733,17 @@ int main(int argc, char** argv) {
             if (s.matchTime > lastMatchTime + 5.f) fogOfWar.reset();
             lastMatchTime = s.matchTime;
             if (net.hasSnapshot()) fogOfWar.reveal(playerPos);
+            if (!s.fog && net.hasSnapshot() && !fogAllRevealed) {   // room has fog of war switched off: explore the whole map
+                for (float wy = 0.f; wy < gc::MAP_H * gc::TILE; wy += 96.f) for (float wx = 0.f; wx < gc::MAP_W * gc::TILE; wx += 96.f) fogOfWar.reveal({ wx, wy });
+                fogOfWar.reveal(playerPos); fogAllRevealed = true;
+            }
+            if (s.fog) fogAllRevealed = false;
         }
 
         // ---- render world ----
         window.setView(gameView);
         window.clear(sf::Color(18, 30, 40));
-        float time = clock.getElapsedTime().asSeconds();
+        float time = worldClock.getElapsedTime().asSeconds();
 
         // ==== WORLD RENDERING (data generated by tools/build_world.py) ====
         // visible tile range (culling) -- ground/overlay tiles are batched per sheet into vertex arrays
@@ -741,26 +823,64 @@ int main(int argc, char** argv) {
             }
         }
 
-        // treasures at home
+        // treasures on the ground, by state: home (bob + owner ring), dropped (bob + countdown arc + pickup-lock flash),
+        // returning (flies home with a short trail), carried (drawn with the carrier below + beacon layer after the fog), inactive (not drawn)
         sf::Sprite tr(assets.treasure);
-        tr.setScale({ 1.8f, 1.8f });
+        tr.setOrigin({ assets.treasure.getSize().x * 0.5f, assets.treasure.getSize().y * 0.5f });
         for (int i = 0; i < gc::NUM_PLAYERS; ++i) {
-            auto& t = s.treasures[i];
-            if (!t.present) continue;
-            if (!fogOfWar.visible(t.x, t.y)) continue;
-            float bob = std::sin(time * 2.5f + i) * 1.2f;
-            tr.setOrigin({ assets.treasure.getSize().x * 0.5f, assets.treasure.getSize().y * 0.5f });
-            tr.setPosition({ t.x, t.y + bob });
-            tr.setColor(sf::Color::White);
+            const auto& t = s.treasures[i];
+            const TState st = (TState)t.state;
+            if (st == TState::Carried || st == TState::Inactive) continue;
+            const sf::Color oc = TEAM_COLOR[i];
+            sf::Vector2f pos{ t.x, t.y };
+            float lift = 0.f, flightE = 0.f;
+            if (st == TState::Returning) {
+                const float f = 1.f - std::clamp(t.timer / gc::RETURN_TRAVEL, 0.f, 1.f);
+                flightE = f * f * (3.f - 2.f * f);
+                const sf::Vector2f from = lastDropPos[i], home{ t.homeX, t.homeY };
+                pos = from + (home - from) * flightE;
+                lift = std::sin(trophy::PI * f) * 14.f;
+            } else if (st == TState::AtHome) pos = { t.x, t.y };
+            if (s.fog && !fogOfWar.visible(pos.x, pos.y)) continue;
+            const float bob = (st == TState::Returning) ? -lift : std::sin(time * 2.5f + i) * 1.2f;
+            if (st == TState::Returning) {   // short trail of fading ghosts behind the cup
+                const sf::Vector2f from = lastDropPos[i], home{ t.homeX, t.homeY };
+                for (int k = 4; k >= 1; --k) {
+                    const float ef = std::max(0.f, flightE - k * 0.07f);
+                    const sf::Vector2f gp = from + (home - from) * ef;
+                    tr.setScale({ 1.8f - 0.2f * k, 1.8f - 0.2f * k });
+                    tr.setColor(sf::Color(oc.r, oc.g, oc.b, (uint8_t)(150 - k * 30)));
+                    tr.setPosition({ gp.x, gp.y - lift * 0.8f });
+                    window.draw(tr);
+                }
+            }
+            if (st == TState::Dropped || st == TState::Returning) {   // ground shadow
+                sf::CircleShape sh(6.f, 12);
+                sh.setOrigin({ 6.f, 6.f }); sh.setScale({ 1.f, 0.45f });
+                sh.setFillColor(sf::Color(0, 0, 0, 80));
+                sh.setPosition({ pos.x, pos.y + 8.f });
+                window.draw(sh);
+            }
+            bool flash = false;
+            if (st == TState::Dropped) flash = t.timer > gc::DROP_RETURN_TIME - gc::DROP_LOCK && std::fmod(time, 0.16f) < 0.08f;
+            tr.setScale({ 1.8f, 1.8f });
+            tr.setColor(flash ? sf::Color(255, 255, 255, 120) : sf::Color::White);
+            tr.setPosition({ pos.x, pos.y + bob });
             window.draw(tr);
-            // small owner ring
-            sf::CircleShape ring(9.f, 18);
-            ring.setFillColor(sf::Color::Transparent);
-            ring.setOutlineColor(sf::Color(TEAM_COLOR[i].r, TEAM_COLOR[i].g, TEAM_COLOR[i].b, 130));
-            ring.setOutlineThickness(1.2f);
-            ring.setOrigin({ 9.f, 9.f });
-            ring.setPosition({ t.x, t.y + bob + 5.f });
-            window.draw(ring);
+            // owner ring (home) / countdown arc (dropped: remaining time / DROP_RETURN_TIME)
+            if (st == TState::Dropped) {
+                trophy::drawArc(window, { pos.x, pos.y + bob + 1.f }, 10.f, 12.f, 1.f, sf::Color(oc.r, oc.g, oc.b, 60));
+                trophy::drawArc(window, { pos.x, pos.y + bob + 1.f }, 10.f, 12.f, t.timer / gc::DROP_RETURN_TIME,
+                                flash ? sf::Color(255, 255, 255, 255) : sf::Color(oc.r, oc.g, oc.b, 255));
+            } else if (st == TState::AtHome) {
+                sf::CircleShape ring(9.f, 18);
+                ring.setFillColor(sf::Color::Transparent);
+                ring.setOutlineColor(sf::Color(oc.r, oc.g, oc.b, 130));
+                ring.setOutlineThickness(1.2f);
+                ring.setOrigin({ 9.f, 9.f });
+                ring.setPosition({ pos.x, pos.y + bob + 5.f });
+                window.draw(ring);
+            }
         }
 
         // projectiles
@@ -768,7 +888,7 @@ int main(int argc, char** argv) {
         pj.setOrigin({ 8.f, 8.f });
         for (int i = 0; i < s.projectileCount; ++i) {
             auto& pr = s.projectiles[i];
-            if (!fogOfWar.visible(pr.x, pr.y)) continue;
+            if (s.fog && !fogOfWar.visible(pr.x, pr.y)) continue;
             int frame = (int)(time * 14.f) & 3;
             pj.setTextureRect(cell(frame, 0));
             sf::Color c = (pr.ownerId < 4) ? TEAM_COLOR[pr.ownerId] : sf::Color::White;
@@ -807,8 +927,13 @@ int main(int argc, char** argv) {
             if (!p.active) continue;
             float px = disp[i].x, py = disp[i].y;
             drawPropsUpTo(py + 16.f);   // everything standing behind this player
-            if (i != myId && !fogOfWar.visible(px + 8.f, py + 8.f)) continue;   // hidden in the fog
+            if (s.fog && i != myId && !p.carrying && !fogOfWar.visible(px + 8.f, py + 8.f)) continue;   // hidden in the fog (carriers are always revealed)
+            if (i != myId && !p.carrying && myId < gc::NUM_PLAYERS && gcmap::secretAt((int)((px + 8.f) / gc::TILE), (int)((py + 8.f) / gc::TILE)) &&
+                std::hypot(px - disp[myId].x, py - disp[myId].y) > 3.f * gc::TILE) continue;   // enemy inside a secret hedge corridor
+            const float lift = trophy::leapLift(p.leapPhase);   // leap arc: sprite offset (negative = up)
+            const float pyd = py + lift;
             // shadow
+            shadow.setScale({ trophy::leapShadow(p.leapPhase), 0.45f * trophy::leapShadow(p.leapPhase) });
             shadow.setPosition({ px + 8.f, py + 13.f });
             window.draw(shadow);
             // local highlight ring
@@ -818,7 +943,7 @@ int main(int argc, char** argv) {
                 ring.setOutlineColor(sf::Color(255, 255, 255, 120 + (int)(std::sin(time * 6.f) * 40 + 40)));
                 ring.setOutlineThickness(1.2f);
                 ring.setOrigin({ 12.f, 12.f });
-                ring.setPosition({ px + 8.f, py + 9.f });
+                ring.setPosition({ px + 8.f, pyd + 9.f });
                 window.draw(ring);
             }
             // carried treasure above head
@@ -828,25 +953,31 @@ int main(int argc, char** argv) {
                 ct.setOrigin({ assets.treasure.getSize().x * 0.5f, assets.treasure.getSize().y * 0.5f });
                 sf::Color src = TEAM_COLOR[s.treasures[p.carriedTreasure].baseOwner];
                 ct.setColor(src);
-                ct.setPosition({ px + 8.f, py - 4.f + std::sin(time * 6.f) * 1.f });
+                const sf::Vector2f cp{ px + 8.f, pyd - 4.f + std::sin(time * 6.f) * 1.f };
+                sf::CircleShape glow(9.f + std::sin(time * 8.f) * 1.5f, 20);   // soft glow behind the carried cup
+                glow.setOrigin({ glow.getRadius(), glow.getRadius() });
+                glow.setFillColor(sf::Color(src.r, src.g, src.b, 70));
+                glow.setPosition(cp);
+                window.draw(glow);
+                ct.setPosition(cp);
                 window.draw(ct);
             }
             // body
             pspr.setTexture(assets.chars[i]);
             pspr.setTextureRect(cell(p.facing, p.moving ? p.walkFrame : 0));
             pspr.setColor(sf::Color::White);
-            pspr.setPosition({ px, py });
+            pspr.setPosition({ px, pyd });
             window.draw(pspr);
             
             // health bar above player (like example gif)
             sf::RectangleShape hpBg(sf::Vector2f{18.f, 4.f});
-            hpBg.setPosition({px - 1.f, py - 6.f});
+            hpBg.setPosition({px - 1.f, pyd - 6.f});
             hpBg.setFillColor(sf::Color(40, 40, 40, 180));
             window.draw(hpBg);
             // Use ammo as "health" proxy (green bar fills based on ammo)
             float hpPercent = static_cast<float>(p.ammo) / gc::MAX_AMMO;
             sf::RectangleShape hpBar(sf::Vector2f{16.f * hpPercent, 2.f});
-            hpBar.setPosition({px, py - 5.f});
+            hpBar.setPosition({px, pyd - 5.f});
             hpBar.setFillColor(sf::Color(90, 220, 100));
             window.draw(hpBar);
             
@@ -856,17 +987,89 @@ int main(int argc, char** argv) {
                 cfgText(name, assets.font, p.name.empty() ? std::string("P") + std::to_string(i) : p.name,
                         7, sf::Color(255, 255, 255), 1.f, sf::Color::Black);
                 centerOrigin(name);
-                name.setPosition({ px + 8.f, py + 20.f });
+                name.setPosition({ px + 8.f, pyd + 20.f });
                 window.draw(name);
             }
         }
 
         drawPropsUpTo(1e9f);            // remaining props (in front of all players)
 
+        // secret hedge bushes (in front of the players, before the fog) + entrance shimmer + discovery sparkles
+        {
+            const sf::Vector2f me2 = myId < gc::NUM_PLAYERS ? disp[myId] + sf::Vector2f(8.f, 8.f) : sf::Vector2f(-1e5f, -1e5f);
+            for (int i = 0; i < world::NUM_SECRET_OBJS; ++i) {
+                const auto& o = world::SECRET_OBJS[i];
+                if (o.tx + o.w < tx0 || o.tx > tx1 || o.ty + o.h < ty0 || o.ty > ty1) continue;
+                const float d = std::hypot(o.tx * gc::TILE + o.w * 8.f - me2.x, o.ty * gc::TILE + o.h * 8.f - me2.y);
+                const float k = std::clamp((d - 1.5f * gc::TILE) / 16.f, 0.f, 1.f);   // 150 within 1.5 tiles, fading back to 255
+                sf::Sprite sp(assets.sheets[o.sheet]);
+                sp.setTextureRect({ { o.c * gc::TILE, o.r * gc::TILE }, { o.w * gc::TILE, o.h * gc::TILE } });
+                sp.setPosition({ float(o.tx * gc::TILE), float(o.ty * gc::TILE) });
+                sp.setColor(sf::Color(255, 255, 255, (uint8_t)(150.f + 105.f * k)));
+                window.draw(sp);
+            }
+            for (int i = 0; i < world::NUM_PASSAGES; ++i) {   // subtle shimmer at undiscovered entrances when near
+                const auto& pa = world::PASSAGES[i];
+                if (fogOfWar.discovered(pa.id)) continue;
+                for (int e = 0; e < 2; ++e) {
+                    const sf::Vector2f c{ ((e ? pa.bx : pa.ax) + 0.5f) * gc::TILE, ((e ? pa.by : pa.ay) + 0.5f) * gc::TILE };
+                    const float d = std::hypot(c.x - me2.x, c.y - me2.y) / gc::TILE;
+                    if (d > 8.f) continue;
+                    const float near = 1.f - d / 8.f;
+                    for (int k = 0; k < 3; ++k) {
+                        const float ph = time * 1.3f + k * 2.1f + pa.id;
+                        const float a = (0.5f + 0.5f * std::sin(ph * 2.f)) * near * 150.f;
+                        sf::CircleShape sp(1.2f, 6);
+                        sp.setOrigin({ 1.2f, 1.2f });
+                        sp.setPosition({ c.x + std::sin(ph * 1.7f) * 6.f, c.y - 6.f + std::fmod(ph, 1.f) * -8.f + 6.f });
+                        sp.setFillColor(sf::Color(255, 250, 170, (uint8_t)a));
+                        window.draw(sp);
+                    }
+                }
+            }
+            for (auto& sp : sparks) {
+                const float f = 1.f - sp.age / 0.9f;
+                sf::CircleShape c(1.6f * f + 0.4f, 6);
+                c.setOrigin({ c.getRadius(), c.getRadius() });
+                c.setPosition(sp.p);
+                c.setFillColor(sf::Color(sp.col.r, sp.col.g, sp.col.b, (uint8_t)(255.f * f)));
+                window.draw(c);
+            }
+        }
+
         // fog of war overlay (world space, after props+players, before the HUD)
         skyLayer.drawClouds(window, viewRect, time);    // clouds above the world, below fog + HUD
         fogOfWar.setTime(time);
-        fogOfWar.draw(window, viewRect);
+        if (s.fog) fogOfWar.draw(window, viewRect);
+
+        // beacon layer (drawn AFTER the fog so carried/dropped trophies show through): pulsing ring + trophy marker above the carrier
+        for (int i = 0; i < gc::NUM_PLAYERS; ++i) {
+            const auto& t = s.treasures[i];
+            const TState st = (TState)t.state;
+            if (st != TState::Carried && st != TState::Dropped) continue;
+            sf::Vector2f bp{ t.x, t.y };
+            if (st == TState::Carried && t.carriedBy < gc::NUM_PLAYERS && s.players[t.carriedBy].active) bp = disp[t.carriedBy] + sf::Vector2f(8.f, 6.f);
+            const sf::Color oc = TEAM_COLOR[i];
+            for (int k = 0; k < 2; ++k) {   // two staggered expanding rings
+                const float ph = std::fmod(time * 0.9f + k * 0.5f, 1.f);
+                const float r = 8.f + ph * 22.f;
+                sf::CircleShape ring(r, 36);
+                ring.setOrigin({ r, r });
+                ring.setPosition(bp);
+                ring.setFillColor(sf::Color::Transparent);
+                ring.setOutlineColor(sf::Color(oc.r, oc.g, oc.b, (uint8_t)(230.f * (1.f - ph))));
+                ring.setOutlineThickness(1.6f);
+                window.draw(ring);
+            }
+            if (st == TState::Carried && s.fog && !fogOfWar.visible(bp.x, bp.y)) {   // carrier hidden in the fog: keep the cup readable
+                sf::Sprite ct(assets.treasure);
+                ct.setScale({ 1.4f, 1.4f });
+                ct.setOrigin({ assets.treasure.getSize().x * 0.5f, assets.treasure.getSize().y * 0.5f });
+                ct.setColor(oc);
+                ct.setPosition({ bp.x, bp.y - 10.f + std::sin(time * 6.f) });
+                window.draw(ct);
+            }
+        }
         weatherFx.drawWorld(window, viewRect, time);    // rain splashes
         weatherFx.drawScreen(window, viewRect, time);   // rain streaks, tint, lightning, leaves
 
@@ -915,10 +1118,30 @@ int main(int argc, char** argv) {
                 drawText(label, 18, here ? sf::Color::White : sf::Color(170, 170, 170), { tx, y + 11.f }, 0, 1.f);
                 if (me) drawText("YOU", 12, c, { x + cardW - 16.f, y + 13.f }, 2, 1.f);
                 else if (p.isBot) drawText("BOT", 12, sf::Color(190, 200, 215), { x + cardW - 16.f, y + 13.f }, 2, 1.f);
+                if (here && !p.isBot) menuUi.drawPing(window, x + cardW - 94.f, y + 25.f, p.ping, p.connected, 12);
 
+                // trophy status chip under the card: home / "Bob carries" / "DROPPED 9s" / returning
+                if (here) {
+                    const auto& tt = s.treasures[i];
+                    std::string chip; sf::Color cc(190, 200, 190);
+                    switch ((TState)tt.state) {
+                        case TState::AtHome:    chip = "home"; cc = sf::Color(150, 220, 160); break;
+                        case TState::Carried:   chip = (tt.carriedBy < gc::NUM_PLAYERS ? playerName(s, tt.carriedBy) : std::string("?")) + " carries";
+                                                cc = sf::Color(255, 120, 100); break;
+                        case TState::Dropped:   chip = "DROPPED " + std::to_string((int)std::ceil(std::max(0.f, tt.timer))) + "s";
+                                                cc = std::fmod(uiTime, 0.8f) < 0.5f ? sf::Color(255, 220, 90) : sf::Color(255, 150, 70); break;
+                        case TState::Returning: chip = "returning"; cc = sf::Color(170, 210, 255); break;
+                        default: break;
+                    }
+                    if (!chip.empty()) {
+                        const float cw = ui::textWidth(F, 12, chip) + 16.f;
+                        ui::drawNinePatch(window, uiTheme.panel3, { {x + 6.f, y + cardH + 1.f}, {cw, 20.f} }, 5.f, 2.f, sf::Color(255, 255, 255, 230));
+                        drawText(chip, 12, cc, { x + 14.f, y + cardH + 5.f }, 0, 1.f);
+                    }
+                }
                 // treasure pips
                 const float icon = 22.f;
-                for (int k = 0; k < gc::WIN_SCORE; ++k) {
+                for (int k = 0; k < (int)s.winScore; ++k) {
                     sf::Sprite sp(assets.treasure);
                     auto ts = assets.treasure.getSize();
                     float sc = icon / (float)std::max(ts.x, ts.y);
@@ -943,13 +1166,70 @@ int main(int argc, char** argv) {
             // match timer
             int secs = std::max(0, (int)std::ceil(s.matchTime));
             char tb[16]; std::snprintf(tb, sizeof(tb), "%d:%02d", secs / 60, secs % 60);
-            ui::drawNinePatch(window, uiTheme.panel2, { {HW * 0.5f - 60.f, 96.f}, {120.f, 46.f} }, 5.f, 3.f);
-            drawText(tb, 28, secs <= 10 ? sf::Color(255, 120, 100) : sf::Color::White, { HW * 0.5f, 118.f }, 1, 2.f);
-            drawText("Steal treasures from enemy bases, bring them home. First to " + std::to_string(gc::WIN_SCORE) + " wins.",
-                     14, sf::Color(255, 240, 180), { HW * 0.5f, 160.f }, 1, 1.5f);
-            if (s.gameOver) {
-                std::string msg = s.winner == 255 ? "DRAW" : (playerName(s, s.winner) + " WINS!");
-                drawText(msg, 44, sf::Color(255, 230, 120), { HW * 0.5f, 220.f }, 1, 3.f);
+            ui::drawNinePatch(window, uiTheme.panel2, { {HW * 0.5f - 60.f, 114.f}, {120.f, 46.f} }, 5.f, 3.f);
+            drawText(tb, 28, secs <= 10 ? sf::Color(255, 120, 100) : sf::Color::White, { HW * 0.5f, 136.f }, 1, 2.f);
+            drawText("Steal treasures from enemy bases, bring them home. First to " + std::to_string((int)s.winScore) + " wins.",
+                     14, sf::Color(255, 240, 180), { HW * 0.5f, 178.f }, 1, 1.5f);
+            if (s.gameOver) {   // victory screen: dim the world, confetti, winner panel + standings
+                const bool iWon = (s.winner != 255 && s.winner == myId);
+                sf::RectangleShape dim({ HW, HH });
+                dim.setFillColor(sf::Color(10, 8, 20, 120));
+                window.draw(dim);
+                const sf::Color conf[6] = { {255, 215, 90}, {232, 80, 80}, {80, 150, 240}, {90, 205, 110}, {255, 150, 220}, {255, 255, 255} };
+                const int pieces = (s.winner == 255) ? 0 : (iWon ? 140 : 60);
+                for (int i = 0; i < pieces; ++i) {   // deterministic falling confetti, no state needed
+                    float fx = std::fmod(i * 0.6180339f, 1.f) * HW + std::sin(uiTime * 1.7f + i) * 18.f;
+                    float fy = std::fmod(uiTime * (70.f + (i % 7) * 18.f) + i * 53.f, HH + 40.f) - 20.f;
+                    sf::RectangleShape piece({ 6.f + (i % 3) * 2.f, 10.f });
+                    piece.setOrigin({ 3.f, 5.f });
+                    piece.setRotation(sf::degrees(uiTime * (90.f + i % 5 * 40.f) + i * 20.f));
+                    piece.setPosition({ fx, fy });
+                    piece.setFillColor(conf[i % 6]);
+                    window.draw(piece);
+                }
+                const float pw = 760.f, ph = 340.f, px = HW * 0.5f - pw * 0.5f, py = 330.f;
+                ui::drawNinePatch(window, uiTheme.panel, { {px, py}, {pw, ph} }, 5.f, 3.f);
+                sf::RectangleShape inner({ pw - 24.f, ph - 24.f });
+                inner.setPosition({ px + 12.f, py + 12.f });
+                inner.setFillColor(sf::Color(28, 18, 12, 225));
+                window.draw(inner);
+                // bobbing trophy beside the title
+                sf::Sprite cup(assets.treasure);
+                cup.setScale({ 4.f, 4.f });
+                cup.setOrigin({ assets.treasure.getSize().x * 0.5f, assets.treasure.getSize().y * 0.5f });
+                for (float side : { -1.f, 1.f }) {
+                    cup.setPosition({ HW * 0.5f + side * 300.f, py + 64.f + std::sin(uiTime * 3.f + side) * 5.f });
+                    window.draw(cup);
+                }
+                std::string wname = s.winner == 255 ? "" : playerName(s, s.winner);
+                if (s.winner == 255) {
+                    drawText("IT'S A DRAW!", 46, sf::Color(255, 230, 120), { HW * 0.5f, py + 62.f }, 1, 3.f);
+                    drawText("Nobody stole enough treasure this time.", 18, sf::Color(235, 230, 220), { HW * 0.5f, py + 112.f }, 1, 1.5f);
+                } else if (iWon) {
+                    drawText("CONGRATULATIONS!", 46, sf::Color(255, 230, 120), { HW * 0.5f, py + 62.f }, 1, 3.f);
+                    drawText(wname + ", you stole the most treasure - you win!", 19, sf::Color(255, 245, 190), { HW * 0.5f, py + 112.f }, 1, 1.5f);
+                } else {
+                    drawText(wname + " WINS!", 46, sf::Color(255, 230, 120), { HW * 0.5f, py + 62.f }, 1, 3.f);
+                    drawText("Congratulations to " + wname + "! Better luck next round.", 18, sf::Color(235, 230, 220), { HW * 0.5f, py + 112.f }, 1, 1.5f);
+                }
+                // final standings, best first
+                int rank[gc::NUM_PLAYERS], n = 0;
+                for (int i = 0; i < gc::NUM_PLAYERS; ++i) if (s.players[i].active) rank[n++] = i;
+                std::sort(rank, rank + n, [&](int a, int b) { return s.players[a].score > s.players[b].score; });
+                float ry = py + 160.f;
+                for (int k = 0; k < n; ++k) {
+                    int i = rank[k];
+                    sf::Color tc = TEAM_COLOR[i];
+                    sf::RectangleShape bar({ 8.f, 24.f });
+                    bar.setPosition({ px + 120.f, ry - 12.f });
+                    bar.setFillColor(tc);
+                    window.draw(bar);
+                    std::string label = std::to_string(k + 1) + ".  " + playerName(s, (uint8_t)i) + (i == myId ? "  (you)" : "");
+                    drawText(label, 20, (int)s.winner == i ? sf::Color(255, 230, 120) : sf::Color(235, 230, 220), { px + 142.f, ry }, 0, 1.f);
+                    drawText(std::to_string(s.players[i].score) + " / " + std::to_string((int)s.winScore) + " treasures", 18,
+                             sf::Color(210, 195, 165), { px + pw - 120.f, ry }, 2, 1.f);
+                    ry += 36.f;
+                }
             }
 
             // toasts
@@ -963,9 +1243,27 @@ int main(int argc, char** argv) {
                 ty += 38.f;
             }
 
-            // chat panel (bottom-left)
-            const float cpW = 480.f, cpH = 260.f, cpX = 12.f, cpY = HH - cpH - 12.f;
-            const float pad = 18.f, inH = 34.f, lineH = 19.f, fs = 14.f;
+            // chat panel (top-left, under the player cards)
+            const sf::Font& CF = assets.chatFontOk ? assets.chatFont : F;
+            const bool realFont = assets.chatFontOk;
+            auto chatW = [&](const std::string& str, unsigned sz) {
+                sf::Text t(CF, realFont ? str : ui::spaced(str, sz), sz);
+                return t.getLocalBounds().size.x + t.getLocalBounds().position.x;
+            };
+            // chat text: black drop shadow + outline so it stays readable over any terrain
+            auto drawChat = [&](const std::string& str, unsigned sz, sf::Color col, sf::Vector2f pos) {
+                sf::Text t(CF, realFont ? str : ui::spaced(str, sz), sz);
+                t.setPosition(pos + sf::Vector2f(2.f, 2.f));
+                t.setFillColor(sf::Color(0, 0, 0, (uint8_t)(col.a * 0.8f)));
+                window.draw(t);
+                t.setPosition(pos);
+                t.setFillColor(col);
+                t.setOutlineColor(sf::Color(0, 0, 0, col.a));
+                t.setOutlineThickness(2.f);
+                window.draw(t);
+            };
+            const float cpW = 372.f, cpH = 300.f, cpX = 12.f, cpY = 118.f;
+            const float pad = 18.f, inH = 38.f, lineH = 24.f, fs = 18.f;
             if (chatActive) {   // the chat window only exists while typing; otherwise messages just float and fade
                 ui::drawNinePatch(window, uiTheme.panel, { {cpX, cpY}, {cpW, cpH} }, 5.f, 3.f);
                 sf::RectangleShape inner({ cpW - 20.f, cpH - 20.f });
@@ -975,7 +1273,7 @@ int main(int argc, char** argv) {
                 drawText("CHAT", 12, sf::Color(255, 220, 140), { cpX + pad, cpY + 9.f }, 0, 1.f);
             }
             const float textW = cpW - pad * 2.f;
-            const float logTop = chatActive ? cpY + 28.f : HH - 12.f - 6 * lineH, logBot = chatActive ? cpY + cpH - pad - inH - 8.f : HH - 14.f;
+            const float logTop = chatActive ? cpY + 28.f : cpY, logBot = chatActive ? cpY + cpH - pad - inH - 8.f : cpY + 6 * lineH;
             // build wrapped visual lines (newest last)
             struct VL { std::string name, text; sf::Color nameCol; sf::Color col; float alpha; bool first; float nameW; };
             std::vector<VL> vls;
@@ -984,26 +1282,29 @@ int main(int argc, char** argv) {
                 if (!chatActive) alpha = std::clamp((9.f - e.age) / 3.f, 0.f, 1.f);
                 if (alpha <= 0.f) continue;
                 sf::Color nc = (e.colorIndex >= 0 && e.colorIndex < 4) ? TEAM_COLOR[e.colorIndex] : sf::Color(200, 200, 200);
+                sf::Color tc(235, 230, 220);
+                if (e.colorIndex == -2) nc = tc = sf::Color(214, 150, 255);        // whispers: violet
+                else if (e.colorIndex == -3) nc = tc = sf::Color(255, 225, 130);   // server lines: yellow
                 std::string nm = e.name + ":";
-                float nw = ui::textWidth(F, (unsigned)fs, nm + " ");
-                auto wrapped = ui::wrapText(F, (unsigned)fs, e.text, textW, nw);
+                float nw = chatW(nm + " ", (unsigned)fs);
+                auto wrapped = ui::wrapText(CF, (unsigned)fs, e.text, textW, nw, !realFont);
                 for (size_t k = 0; k < wrapped.size(); ++k)
-                    vls.push_back({ k == 0 ? nm : "", wrapped[k], nc, sf::Color(235, 230, 220), alpha, k == 0, nw });
+                    vls.push_back({ k == 0 ? nm : "", wrapped[k], nc, tc, alpha, k == 0, nw });
             }
             int maxLines = (int)((logBot - logTop) / lineH);
             int start = std::max(0, (int)vls.size() - maxLines);
-            float ly = logBot - (float)((int)vls.size() - start) * lineH;
+            float ly = chatActive ? logBot - (float)((int)vls.size() - start) * lineH : logTop;   // closed: top-aligned, newest at the bottom
             for (int k = start; k < (int)vls.size(); ++k, ly += lineH) {
                 auto& v = vls[k];
                 uint8_t a = (uint8_t)(255.f * v.alpha);
                 float ox = cpX + pad;
-                const float ol = chatActive ? 0.f : 1.5f;   // floating lines get an outline instead of a panel
+                if (!chatActive) ox = cpX + 6.f;
                 if (v.first)
-                    drawText(v.name, (unsigned)fs, sf::Color(v.nameCol.r, v.nameCol.g, v.nameCol.b, a), { ox, ly }, 0, 1.f);
-                drawText(v.text, (unsigned)fs, sf::Color(v.col.r, v.col.g, v.col.b, a), { ox + (v.first ? v.nameW : 0.f), ly }, 0, ol);
+                    drawChat(v.name, (unsigned)fs, sf::Color(v.nameCol.r, v.nameCol.g, v.nameCol.b, a), { ox, ly });
+                drawChat(v.text, (unsigned)fs, sf::Color(v.col.r, v.col.g, v.col.b, a), { ox + (v.first ? v.nameW : 0.f), ly });
             }
             if (vls.empty() && chatActive)
-                drawText("No messages yet", 13, sf::Color(170, 150, 120, 160), { cpX + pad, logBot - lineH }, 0);
+                drawChat("No messages yet", 16, sf::Color(190, 170, 140, 200), { cpX + pad, logBot - lineH });
 
             if (chatActive) {
             // input bar
@@ -1013,11 +1314,11 @@ int main(int argc, char** argv) {
             const float iy = ib.position.y + ib.size.y * 0.5f - 8.f;
             if (chatActive) {
                 std::string shown = chatInput;
-                while (shown.size() > 1 && ui::textWidth(F, 15, shown) > ib.size.x - 100.f) shown.erase(0, 1);
-                drawText(shown, 15, sf::Color(255, 245, 160), { ib.position.x + 12.f, iy }, 0);
+                while (shown.size() > 1 && chatW(shown, 18) > ib.size.x - 100.f) shown.erase(0, 1);
+                drawChat(shown, 18, sf::Color(255, 245, 160), { ib.position.x + 12.f, iy - 3.f });
                 if (std::fmod(uiTime, 1.0f) < 0.55f) {
-                    float cw = shown.empty() ? 0.f : ui::textWidth(F, 15, shown);
-                    sf::RectangleShape cur({ 2.f, 17.f });
+                    float cw = shown.empty() ? 0.f : chatW(shown, 18);
+                    sf::RectangleShape cur({ 2.f, 20.f });
                     cur.setPosition({ ib.position.x + 13.f + cw, iy + 1.f });
                     cur.setFillColor(sf::Color(255, 245, 160));
                     window.draw(cur);
@@ -1029,17 +1330,96 @@ int main(int argc, char** argv) {
 
             }
 
-            // minimap (bottom-right): explored area only, base markers, local player
-            if (myId < gc::NUM_PLAYERS)
+            // minimap (bottom-right): explored area only, base markers, trophies, discovered passages, local player
+            if (myId < gc::NUM_PLAYERS) {
+                std::vector<fog::MapMarker> mk;
+                for (int i = 0; i < gc::NUM_PLAYERS; ++i) {
+                    const auto& t = s.treasures[i];
+                    const TState st = (TState)t.state;
+                    if (st == TState::Inactive) continue;
+                    sf::Vector2f mp{ t.x, t.y };
+                    if (st == TState::Carried && t.carriedBy < gc::NUM_PLAYERS) mp = disp[t.carriedBy] + sf::Vector2f(8.f, 8.f);
+                    mk.push_back({ mp.x, mp.y, st == TState::Carried ? 1 : (st == TState::Dropped ? 2 : 0), TEAM_COLOR[i] });
+                }
                 fogOfWar.drawMinimap(window, { HW - 12.f - 3.f - gc::MAP_W * 3.f, HH - 54.f - gc::MAP_H * 3.f }, 3.f, TEAM_COLOR,
-                                     disp[myId] + sf::Vector2f(8.f, 8.f), TEAM_COLOR[myId], viewRect, uiTime);
+                                     disp[myId] + sf::Vector2f(8.f, 8.f), TEAM_COLOR[myId], viewRect, uiTime, &mk);
+
+                // screen-edge arrows toward carried/dropped trophies (and my base when I carry one)
+                const sf::Vector2f mc = disp[myId] + sf::Vector2f(8.f, 8.f);
+                const float Z = HW / viewRect.size.x;   // world -> HUD scale (3x)
+                auto edgeMark = [&](sf::Vector2f wp, sf::Color col, int owner, const std::string& label, bool pulse) {
+                    const sf::Vector2f hp{ (wp.x - viewRect.position.x) * Z, (wp.y - viewRect.position.y) * Z };
+                    const auto ea = trophy::edgeArrow(hp.x, hp.y, HW * 0.5f, HH * 0.5f, HW * 0.5f - 60.f, HH * 0.5f - 110.f);
+                    if (ea.onscreen) return;
+                    const float pa = pulse ? 0.65f + 0.35f * std::sin(uiTime * 8.f) : 1.f;
+                    sf::ConvexShape ar(3);
+                    ar.setPoint(0, { 16.f, 0.f }); ar.setPoint(1, { -10.f, -12.f }); ar.setPoint(2, { -10.f, 12.f });
+                    ar.setPosition({ ea.x, ea.y });
+                    ar.setRotation(sf::radians(ea.angle));
+                    ar.setScale({ pa, pa });
+                    ar.setFillColor(sf::Color(col.r, col.g, col.b, 235));
+                    ar.setOutlineColor(sf::Color(0, 0, 0, 200));
+                    ar.setOutlineThickness(2.f);
+                    window.draw(ar);
+                    // mini cup + distance, placed inward from the arrow
+                    const sf::Vector2f in2{ ea.x - std::cos(ea.angle) * 34.f, ea.y - std::sin(ea.angle) * 34.f };
+                    if (owner >= 0) {
+                        sf::Sprite cup(assets.treasure);
+                        const auto ts = assets.treasure.getSize();
+                        const float sc = 20.f / (float)std::max(ts.x, ts.y);
+                        cup.setScale({ sc, sc });
+                        cup.setOrigin({ ts.x * 0.5f, ts.y * 0.5f });
+                        cup.setPosition({ in2.x, in2.y - 8.f });
+                        cup.setColor(TEAM_COLOR[owner]);
+                        window.draw(cup);
+                    }
+                    const int tiles = (int)std::lround(std::hypot(wp.x - mc.x, wp.y - mc.y) / gc::TILE);
+                    drawText(std::to_string(tiles) + "t", 13, sf::Color(255, 255, 255), { in2.x, in2.y + 8.f }, 1, 1.5f);
+                    if (!label.empty()) drawText(label, 12, col, { in2.x, in2.y + 24.f }, 1, 1.5f);
+                };
+                const bool iCarry = s.players[myId].carrying;
+                for (int i = 0; i < gc::NUM_PLAYERS; ++i) {
+                    const auto& t = s.treasures[i];
+                    const TState st = (TState)t.state;
+                    if (st != TState::Carried && st != TState::Dropped) continue;
+                    if (st == TState::Carried && t.carriedBy == myId) continue;   // I carry it myself
+                    sf::Vector2f wp{ t.x, t.y };
+                    if (st == TState::Carried && t.carriedBy < gc::NUM_PLAYERS) wp = disp[t.carriedBy] + sf::Vector2f(8.f, 8.f);
+                    const bool mine = (i == myId);
+                    if (mine && st == TState::Carried) edgeMark(wp, sf::Color(255, 70, 60), i, "YOUR TREASURE", true);
+                    else edgeMark(wp, TEAM_COLOR[i], i, st == TState::Dropped ? (mine ? "RECOVER" : "DROPPED") : "", st == TState::Dropped);
+                }
+                if (iCarry) {
+                    const auto& b = gcmap::bases()[myId];
+                    edgeMark({ b.treasureX, b.treasureY }, sf::Color(110, 240, 130), -1, "DELIVER", false);
+                }
+
+                // leap cooldown chip (bottom-left)
+                {
+                    const auto& mp = s.players[myId];
+                    const float cdMax = (mp.carrying ? gc::LEAP_CD_CARRIER : gc::LEAP_CD) * 10.f;
+                    const bool ready = mp.leapCd == 0 && mp.leapPhase == 0;
+                    const float bx = 16.f, by = HH - 52.f, bw = 150.f;
+                    ui::drawNinePatch(window, uiTheme.panel3, { {bx, by}, {bw, 36.f} }, 5.f, 2.f);
+                    sf::RectangleShape fill({ (bw - 16.f) * (ready ? 1.f : 1.f - std::clamp(mp.leapCd / cdMax, 0.f, 1.f)), 5.f });
+                    fill.setPosition({ bx + 8.f, by + 25.f });
+                    fill.setFillColor(ready ? sf::Color(120, 235, 140) : sf::Color(240, 190, 90));
+                    window.draw(fill);
+                    char lb[32];
+                    if (ready) std::snprintf(lb, sizeof(lb), "LEAP ready");
+                    else if (mp.leapPhase) std::snprintf(lb, sizeof(lb), "LEAP...");
+                    else std::snprintf(lb, sizeof(lb), "LEAP %.1fs", mp.leapCd / 10.f);
+                    drawText(lb, 14, ready ? sf::Color(170, 255, 180) : sf::Color(255, 220, 140), { bx + bw * 0.5f, by + 12.f }, 1, 1.f);
+                }
+            }
 
             // controls hint (bottom, right of chat)
-            drawText("WASD move  |  Space shoot (sends foes home)  |  T / Enter chat  |  Esc close", 14,
+            drawText("WASD move  |  Space shoot  |  Shift/J leap  |  T / Enter chat  |  Esc close", 14,
                      sf::Color(230, 225, 210), { HW - 16.f, HH - 28.f }, 2, 1.5f);
         }
 
-        if (!net.connected) {
+        if (reconnecting) menuUi.drawReconnect(window, reconnAttempt, reconnLeft);
+        if (!net.connected && !reconnecting) {
             window.setView(hudView);
             sf::RectangleShape bg(sf::Vector2f{ 1280.f, 960.f });
             bg.setFillColor(sf::Color(0, 0, 0, 170));

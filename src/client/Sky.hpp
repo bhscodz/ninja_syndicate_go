@@ -48,7 +48,7 @@ public:
         }
         for (auto& c : c_) {
             c.x = rnd() * SPAN; c.y = rnd() * (gc::MAP_H * gc::TILE + 300.f) - 150.f;
-            c.tex = (int)(rnd() * NTEX) % NTEX; c.scale = 1.f + std::floor(rnd() * 3.f);
+            c.tex = (int)(rnd() * NTEX) % NTEX; c.scale = 2.f + std::floor(rnd() * 3.f);
             c.speed = 5.f + rnd() * 6.f; c.alpha = 90.f + rnd() * 40.f;
         }
     }
@@ -66,7 +66,8 @@ private:
     float cover_ = 0.f;
 
     void draw(sf::RenderTarget& rt, const sf::FloatRect& view, float time, bool shadows) {
-        const int active = 34 + (int)((NCLOUDS - 34) * cover_);
+        if (!shadows) return;   // like the pack example: no visible clouds, only their soft shadows drifting over the ground
+        const int active = 13 + (int)(9 * cover_);
         for (int ci = 0; ci < active; ++ci) {
             const auto& c = c_[ci];
             float x = std::fmod(c.x + c.speed * time, SPAN);
@@ -81,8 +82,8 @@ private:
             sf::Sprite sp(shadows ? shadow_[c.tex] : cloud_[c.tex]);
             sp.setScale({ c.scale, c.scale });
             sp.setPosition({ px, py });
-            if (shadows) sp.setColor(sf::Color(20, 30, 60, (uint8_t)(52 + 40 * cover_)));
-            else { uint8_t g = (uint8_t)(255 - 95 * cover_); sp.setColor(sf::Color(g, (uint8_t)(g + 4), (uint8_t)(g + 14 > 255 ? 255 : g + 14), (uint8_t)std::min(235.f, c.alpha * (1.f + 0.9f * cover_)))); }
+            if (shadows) sp.setColor(sf::Color(40, 28, 14, (uint8_t)(34 + 34 * cover_)));
+            else { uint8_t g = (uint8_t)(255 - 80 * cover_); sp.setColor(sf::Color(g, (uint8_t)(g + 4), (uint8_t)(g + 14 > 255 ? 255 : g + 14), (uint8_t)std::min(215.f, c.alpha * (1.f + 0.45f * cover_)))); }
             rt.draw(sp);
         }
     }

@@ -35,6 +35,8 @@ def load_world():
 
 W, H, A, OBJ, FLAGS, BASES, FILES = load_world()
 SOLID = A["SOLID"]
+SECRET = A["SECRET"] if "SECRET" in A else np.zeros_like(SOLID)
+HARD = (SOLID == 1) | (SOLID == 3)       # solid objects for the visual checks (3 = Low obstacle: fence/wall, leapable)
 sheets = [np.array(Image.open(os.path.join(ASSET, f)).convert("RGBA")) for f in FILES]
 
 spec = importlib.util.spec_from_file_location("wc", os.path.join(ROOT, "tools/world_catalog.py"))
@@ -113,7 +115,7 @@ def R(s=""):
     rep.append(s)
 
 
-def sect(t, items, color=None, limit=40):
+def sect(t, items, color=None, limit=int(os.environ.get("AUDIT_LIMIT", 40))):
     R(f"{t}: {len(items)}")
     for it in items[:limit]:
         R("   " + str(it))
@@ -136,10 +138,13 @@ for i in range(len(OBJ)):
 inv = []
 for y in range(H):
     for x in range(W):
-        if SOLID[y, x] == 1 and opq[y, x] < BIT:
+        if HARD[y, x] and opq[y, x] < BIT:
             ov = A["OVERLAY"][y, x]
             inv.append((x, y, "cosmetic-only" if cos_cover[y, x] > 0 else ("overlay-only" if ov != 0xFFFF else "nothing")))
-sect("A(a) solid=1 tiles with no visible non-cosmetic object (invisible walls)", inv, "red")
+small = [t for t in inv if t[2] == "cosmetic-only" and cos_cover[t[1], t[0]] >= 0.25]
+inv = [t for t in inv if t not in small]
+sect("A(a) solid=1 tiles with no visible object at all (invisible walls)", inv, "red")
+sect("A(a2) solid tiles covered only by small cosmetic-class props (bush/pebble/awning: intentional cover?)", small, None, 12)
 
 # ---- A(b) visible bodies that are walkable (bottom row of each non-cosmetic object)
 body = []
@@ -149,7 +154,7 @@ for i, (s, c, r, w, h, tx, ty) in enumerate(OBJ):
     y = ty + h - 1
     for dx in range(w):
         x = tx + dx
-        if 0 <= x < W and 0 <= y < H and objmask[i, y, x] >= 0.35 and SOLID[y, x] == 0:
+        if 0 <= x < W and 0 <= y < H and objmask[i, y, x] >= 0.35 and SOLID[y, x] == 0 and not SECRET[y, x]:
             body.append((x, y, oname(i), f"obj#{i}@{tx},{ty} {w}x{h} opaque={objmask[i, y, x]:.2f}"))
 sect("A(b) bottom-row opaque tiles of non-cosmetic objects that are WALKABLE", body, "yellow", 60)
 
@@ -192,7 +197,7 @@ sect("A(e1) walkable tiles in the outermost ring", ring, "red")
 thick = min(min(next((k for k in range(0, W // 2) if SOLID[y, k] == 0), 99) for y in range(H)),
             min(next((k for k in range(0, H // 2) if SOLID[k, x] == 0), 99) for x in range(W)))
 R(f"A(e2) minimum solid border thickness (tiles): {thick}")
-notree = [(x, y) for y in range(H) for x in range(W) if min(x, y, W - 1 - x, H - 1 - y) < 2 and SOLID[y, x] == 1 and opq[y, x] < BIT]
+notree = [(x, y) for y in range(H) for x in range(W) if min(x, y, W - 1 - x, H - 1 - y) < 2 and HARD[y, x] and opq[y, x] < BIT]
 sect("A(e3) border-band solid tiles without a visible object", notree, "red")
 
 # ---- A(f) objects
@@ -226,15 +231,15 @@ for i, (s, c, r, w, h, tx, ty) in enumerate(OBJ):
     for dy in range(h):
         for dx in range(w):
             x, y = tx + dx, ty + dy
-            if 0 <= x < W and 0 <= y < H and objmask[i, y, x] > 0 and SOLID[y, x] == 1 and opq[y, x] < BIT:
+            if 0 <= x < W and 0 <= y < H and objmask[i, y, x] > 0 and HARD[y, x] and opq[y, x] < BIT:
                 cos_on_solid.append((x, y, f"cosmetic {oname(i)} on solid tile"))
-sect("A(f4) cosmetic objects sitting on otherwise-empty solid tiles", cos_on_solid, "magenta")
+R(f"A(f4) cosmetic objects on otherwise-empty solid tiles: {len(cos_on_solid)} (same tiles as A(a2); informational)")
 
 # ---- D y-sort
 ysort = []
 for i in nc:
     s, c, r, w, h, tx, ty = OBJ[i]
-    rows = [y for y in range(ty, ty + h) if any(0 <= tx + dx < W and 0 <= y < H and SOLID[y, tx + dx] == 1 and objmask[i, y, tx + dx] > 0 for dx in range(w))]
+    rows = [y for y in range(ty, ty + h) if any(0 <= tx + dx < W and 0 <= y < H and HARD[y, tx + dx] and objmask[i, y, tx + dx] > 0 for dx in range(w))]
     if rows and max(rows) < ty + h - 1:
         ysort.append((tx, ty, f"{oname(i)} obj#{i}: lowest solid row {max(rows)} but sprite bottom row {ty + h - 1} (player just south of the solid row is drawn BEHIND the sprite's lower rows)"))
 sorted_ok = all(OBJ[k][6] + OBJ[k][4] <= OBJ[k + 1][6] + OBJ[k + 1][4] for k in range(len(OBJ) - 1))
@@ -270,6 +275,14 @@ for y in range(H):
             asym["xy"].append((x, y, f"{v}!={SOLID[H - 1 - y, W - 1 - x]}"))
 for k, v in asym.items():
     sect(f"E2 SOLID asymmetry mirror-{k} (each pair listed twice)", v, None, 12)
+sec_as = [(x, y, "SECRET asym") for y in range(H) for x in range(W)
+          if (SECRET[y, x] > 0) != (SECRET[y, W - 1 - x] > 0) or (SECRET[y, x] > 0) != (SECRET[H - 1 - y, x] > 0)]
+sect("E4 SECRET asymmetry (mirror x / y)", sec_as, "red", 12)
+sec_solid = [(x, y, f"secret cell id {SECRET[y, x]} on solid={SOLID[y, x]}") for y in range(H) for x in range(W) if SECRET[y, x] and SOLID[y, x] != 0]
+sect("E5 SECRET cells that are solid (must be walkable)", sec_solid, "red")
+low = [(x, y) for y in range(H) for x in range(W) if SOLID[y, x] == 3]
+R(f"E6 SOLID==3 (Low) cells: {len(low)}; mirror-asymmetric: {sum(1 for (x, y) in low if SOLID[y, W - 1 - x] != 3 or SOLID[H - 1 - y, x] != 3)}")
+R(f"E7 secret cells: {int((SECRET > 0).sum())}, passage ids: {sorted(set(int(v) for v in SECRET.flatten() if v))}")
 R(f"E3 bases (cx,cy,cw,ch,tx,ty,sx,sy): {BASES}")
 
 # ---- overlay PNG
@@ -280,8 +293,12 @@ d = ImageDraw.Draw(ov)
 for y in range(H):
     for x in range(W):
         v = SOLID[y, x]
+        if SECRET[y, x]:
+            d.rectangle([x * T * S, y * T * S, (x + 1) * T * S - 1, (y + 1) * T * S - 1], fill=(0, 255, 0, 60))
         if v == 1:
             d.rectangle([x * T * S, y * T * S, (x + 1) * T * S - 1, (y + 1) * T * S - 1], fill=(255, 0, 0, 70))
+        elif v == 3:
+            d.rectangle([x * T * S, y * T * S, (x + 1) * T * S - 1, (y + 1) * T * S - 1], fill=(255, 160, 0, 70))
         elif v == 2:
             d.rectangle([x * T * S, y * T * S, (x + 1) * T * S - 1, (y + 1) * T * S - 1], fill=(0, 80, 255, 60))
 col = {"red": (255, 0, 0, 255), "yellow": (255, 230, 0, 255), "cyan": (0, 255, 255, 255), "magenta": (255, 0, 255, 255)}

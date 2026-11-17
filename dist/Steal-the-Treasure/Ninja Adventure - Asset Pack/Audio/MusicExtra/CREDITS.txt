@@ -1,0 +1,9 @@
+Extra background music (downloaded from https://incompetech.com)
+Music by Kevin MacLeod (incompetech.com), licensed under Creative Commons: By Attribution 4.0
+https://creativecommons.org/licenses/by/4.0/
+
+Calm / exploration playlist:
+  "Sneaky Snitch", "Pixelland", "Carefree",
+  "Monkeys Spinning Monkeys", "Wallpaper"
+Chase music (played while you carry a trophy):
+  "Black Vortex", "Hot Pursuit", "Volatile Reaction", "Prelude and Action"

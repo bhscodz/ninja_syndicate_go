@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <string>
 #include "Constants.hpp"
+#include "Rules.hpp"
 #include "Map.hpp"
 
 enum class Msg : uint32_t {
@@ -106,6 +107,12 @@ enum class EvType : uint8_t {
     Lost,     // a = player lost connection (reserved slot)
     Reconnected, // a = player came back
     Info,     // generic, see text via a/b mapping (unused in payload)
+    Drop,     // a = victim (carrier hit), b = shooter, c = treasure id     "X lost Y's treasure"
+    Recover,  // a = owner, c = treasure id                                  owner touched the dropped trophy -> home
+    Returned, // c = treasure id                                             a dropped trophy flew home by itself
+    Leap,     // a = player takes off
+    Land,     // a = player lands
+    Secret,   // a = player (client-side discovery; the server need not send it)
 };
 
 struct PlayerState {
@@ -122,9 +129,13 @@ struct PlayerState {
     bool     moving = false;
     int32_t  walkFrame = 0;
     uint16_t ping = 0;           // server-measured RTT in ms
+    uint8_t  leapCd = 0;         // leap cooldown left in tenths of a second (0 = ready)
+    uint8_t  leapPhase = 0;      // 0 = on the ground, 1..255 = progress through the leap arc (airborne)
     bool     connected = true;   // false while the slot is reserved for a reconnecting player
     // server-only transient fields (not serialised):
     float    shootCd = 0, ammoTimer = 0, walkTimer = 0;
+    float    leapT = 0, leapCdT = 0, leapFromX = 0, leapFromY = 0, leapToX = 0, leapToY = 0;   // leap (server)
+    bool     leapQueued = false, shootQueued = false;                                           // latched input edges (server)
     float    botStuck = 0, botShootCd = 0;
     int32_t  botMode = 0;
 };
@@ -136,6 +147,8 @@ struct TreasureState {
     float   x = 0, y = 0;         // current position (pixel centre)
     bool    present = true;       // sitting at home
     uint8_t carriedBy = 255;      // player id carrying, else 255
+    uint8_t state = 0;            // TState (Rules.hpp): AtHome / Carried / Dropped / Returning / Inactive
+    float   timer = 0;            // Dropped: seconds until it returns home; Returning: flight time left
 };
 
 struct ProjectileState {
@@ -157,6 +170,7 @@ struct Snapshot {
     uint8_t winScore = gc::WIN_SCORE;   // per-room rules (from RoomSettings)
     float   matchLen = gc::MATCH_TIME;
     bool    fog = true;
+    bool    overtime = false;           // sudden death: the clock ended in a tie, first delivery wins (matchTime counts the overtime down)
 };
 
 enum ChatKind : uint8_t { CHAT_NORMAL = 0, CHAT_WHISPER_FROM = 1, CHAT_WHISPER_TO = 2, CHAT_SYSTEM = 3 };
@@ -172,6 +186,7 @@ struct ClientInput {
     float   dirX = 0, dirY = 0;   // desired movement (normalised server-side)
     int32_t facing = gc::FACE_DOWN;
     bool    shoot = false;        // edge: only fires on the frames the client sets this
+    bool    leap  = false;        // edge: leap over water / low walls (Shift or J)
 };
 
 struct GameEvent {
@@ -183,18 +198,18 @@ struct GameEvent {
 inline sf::Packet& operator<<(sf::Packet& p, const PlayerState& s) {
     return p << s.id << s.active << s.isBot << s.name
              << s.x << s.y << s.facing << s.ammo << s.score
-             << s.carrying << s.carriedTreasure << s.moving << s.walkFrame << s.ping << s.connected;
+             << s.carrying << s.carriedTreasure << s.moving << s.walkFrame << s.ping << s.connected << s.leapCd << s.leapPhase;
 }
 inline sf::Packet& operator>>(sf::Packet& p, PlayerState& s) {
     return p >> s.id >> s.active >> s.isBot >> s.name
              >> s.x >> s.y >> s.facing >> s.ammo >> s.score
-             >> s.carrying >> s.carriedTreasure >> s.moving >> s.walkFrame >> s.ping >> s.connected;
+             >> s.carrying >> s.carriedTreasure >> s.moving >> s.walkFrame >> s.ping >> s.connected >> s.leapCd >> s.leapPhase;
 }
 inline sf::Packet& operator<<(sf::Packet& p, const TreasureState& t) {
-    return p << t.id << t.baseOwner << t.homeX << t.homeY << t.x << t.y << t.present << t.carriedBy;
+    return p << t.id << t.baseOwner << t.homeX << t.homeY << t.x << t.y << t.present << t.carriedBy << t.state << t.timer;
 }
 inline sf::Packet& operator>>(sf::Packet& p, TreasureState& t) {
-    return p >> t.id >> t.baseOwner >> t.homeX >> t.homeY >> t.x >> t.y >> t.present >> t.carriedBy;
+    return p >> t.id >> t.baseOwner >> t.homeX >> t.homeY >> t.x >> t.y >> t.present >> t.carriedBy >> t.state >> t.timer;
 }
 inline sf::Packet& operator<<(sf::Packet& p, const ProjectileState& pr) {
     return p << pr.id << pr.ownerId << pr.x << pr.y << pr.vx << pr.vy << pr.dir << pr.frame;
@@ -208,7 +223,7 @@ inline sf::Packet& operator<<(sf::Packet& p, const Snapshot& s) {
     for (const auto& t : s.treasures) p << t;
     p << s.projectileCount;
     for (int i = 0; i < s.projectileCount; ++i) p << s.projectiles[i];
-    p << s.winScore << s.matchLen << s.fog;
+    p << s.winScore << s.matchLen << s.fog << s.overtime;
     return p;
 }
 inline sf::Packet& operator>>(sf::Packet& p, Snapshot& s) {
@@ -219,7 +234,7 @@ inline sf::Packet& operator>>(sf::Packet& p, Snapshot& s) {
     if (s.projectileCount < 0) s.projectileCount = 0;
     if (s.projectileCount > gc::MAX_PROJECTILES) s.projectileCount = gc::MAX_PROJECTILES;
     for (int i = 0; i < s.projectileCount; ++i) p >> s.projectiles[i];
-    p >> s.winScore >> s.matchLen >> s.fog;
+    p >> s.winScore >> s.matchLen >> s.fog >> s.overtime;
     return p;
 }
 inline sf::Packet& operator<<(sf::Packet& p, const ChatLine& c) {

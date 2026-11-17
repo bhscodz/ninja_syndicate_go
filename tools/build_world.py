@@ -39,6 +39,7 @@ occupied = grid(False)
 biome = grid(0)                               # 0 grass, 1 sand, 2 snow
 dirt, water, swamp, ice, sand, snow = (grid(False) for _ in range(6))
 bridge, stones, island = grid(False), grid(False), grid(False)
+SECRET_GRID = grid(0)
 protect = grid(False)                         # cells that must stay free of solid props (roads, bridge ends, plazas)
 
 # ----------------------------------------------------------------- spline / blob helpers
@@ -279,21 +280,27 @@ for y in range(H):
                     if ing(x + dx, y + dy): pass
 
 # ----------------------------------------------------------------- 3. object helpers
-def add_obj(name, tx, ty, foot):
+cur_group = [0]
+obj_meta = []                                  # parallel to objects: (placement group id, footprint)
+def add_obj(name, tx, ty, foot, low=False):
     sheet, c, r, w, h = SPR[name]
     objects.append((name, tx, ty, w, h, sheet, c, r))
+    obj_meta.append((cur_group[0], list(foot)))
     for yy in range(ty, ty + h):
         for xx in range(tx, tx + w):
             if ing(xx, yy): occupied[yy][xx] = True
     for (dx, dy, fw, fh) in foot:
         for yy in range(ty + dy, ty + dy + fh):
             for xx in range(tx + dx, tx + dx + fw):
-                if ing(xx, yy): solid[yy][xx] = 1
+                if ing(xx, yy): solid[yy][xx] = 3 if low else 1
 def footprint(w, h, solid_rows=1, foot=None):
     if foot is not None: return foot
     return [(0, h - solid_rows, w, solid_rows)] if solid_rows > 0 else []
+DEFAULT_FOOT = {"palm_pair": [(1, 2, 2, 1)]}   # sprites whose trunks do not span the full width
 def mfoot(foot, w, h, mx, my):
-    return [((w - dx - fw) if mx else dx, (h - dy - fh) if my else dy, fw, fh) for (dx, dy, fw, fh) in foot]
+    # Mirrored copies reuse the SAME unflipped sprite (the client cannot flip sprites), so the collision
+    # footprint must stay in sprite space: flipping it put solid tiles on the canopy and left the trunk walkable.
+    return list(foot)
 def free_area(tx, ty, w, h, margin=0, ondirt=False, onwater=False):
     for yy in range(ty - margin, ty + h + margin):
         for xx in range(tx - margin, tx + w + margin):
@@ -307,13 +314,22 @@ def free_area(tx, ty, w, h, margin=0, ondirt=False, onwater=False):
     return True
 def coords4(tx, ty, w, h):
     return [(W - tx - w if mx else tx, H - ty - h if my else ty, mx, my) for mx in (False, True) for my in (False, True)]
-def place(name, tx, ty, solid_rows=1, foot=None, margin=0, ondirt=False, onwater=False, mirror=True, req=True):
+def place(name, tx, ty, solid_rows=1, foot=None, margin=0, ondirt=False, onwater=False, mirror=True, req=True, low=False):
     """place the sprite whose top-left (local quadrant coords) is tx,ty at all four mirrored spots; False when blocked"""
     sheet, c, r, w, h = SPR[name]
-    f = footprint(w, h, solid_rows, foot)
+    f = footprint(w, h, solid_rows, foot if foot is not None else DEFAULT_FOOT.get(name))
     pos = coords4(tx, ty, w, h) if mirror else [(tx, ty, False, False)]
     if mirror and (tx + w > QW or ty + h > QH): return False
+    if mirror and f:
+        # sprites are never flipped, so the bottom-half copy is nudged up until its solid rows are the exact
+        # mirror image of the top copy's -> collision stays perfectly symmetric (fairness) AND matches the art
+        r0, r1 = min(d[1] for d in f), max(d[1] + d[3] for d in f)
+        pos = [(x, (y - (r0 + r1 - h)) if my else y, mx, my) for (x, y, mx, my) in pos]
     seen = set(); ok = True
+    up = sorted(set((x, y) for (x, y, mx, my) in pos))
+    for i in range(len(up)):                       # copies of the same sprite must not overlap each other
+        for j in range(i + 1, len(up)):
+            if abs(up[i][0] - up[j][0]) < w and abs(up[i][1] - up[j][1]) < h: ok = False
     for (x, y, mx, my) in pos:
         if (x, y) in seen: continue
         seen.add((x, y))
@@ -322,12 +338,15 @@ def place(name, tx, ty, solid_rows=1, foot=None, margin=0, ondirt=False, onwater
         if req: print("WARN blocked:", name, tx, ty)
         return False
     seen = set()
+    cur_group[0] += 1
     for (x, y, mx, my) in pos:
         if (x, y) in seen: continue
-        seen.add((x, y)); add_obj(name, x, y, mfoot(f, w, h, mx, my))
+        seen.add((x, y)); add_obj(name, x, y, mfoot(f, w, h, mx, my), low)
     return True
 def watery(x, y, w, h, m=1):
     return any(ing(xx, yy) and wet(xx, yy) for yy in range(y - m, y + h + m) for xx in range(x - m, x + w + m))
+def near_road(x, y, w, h, m=1):
+    return any(ing(xx, yy) and dirt[yy][xx] for yy in range(y - m, y + h + m) for xx in range(x - m, x + w + m))
 def scatter(zone, names, count, solid_rows=1, margin=1, biomes=(0,), tries=5000, avoid_wet=True, weights=None):
     x0, y0, x1, y1 = zone
     done = 0
@@ -338,7 +357,7 @@ def scatter(zone, names, count, solid_rows=1, margin=1, biomes=(0,), tries=5000,
         if tx + w > QW or ty + h > QH: continue
         ok = True
         for (x, y, mx, my) in coords4(tx, ty, w, h):
-            if not free_area(x, y, w, h, margin) or (avoid_wet and watery(x, y, w, h)) or \
+            if not free_area(x, y, w, h, margin) or near_road(x, y, w, h) or (avoid_wet and watery(x, y, w, h)) or \
                any(biome[yy][xx] not in biomes for yy in range(y, y + h) for xx in range(x, x + w)): ok = False
         if ok and place(n, tx, ty, solid_rows, margin=margin, req=False): done += 1
     return done
@@ -350,6 +369,7 @@ def grove(cx, cy, rad, names, n, solid_rows=1, biomes=(0,), margin=0):
         tx, ty = int(rnd.gauss(cx, rad)) , int(rnd.gauss(cy, rad * 0.8))
         if tx < 2 or ty < 2 or tx + w > QW or ty + h > QH: continue
         if any(biome[yy][xx] not in biomes for (x, y, mx, my) in coords4(tx, ty, w, h) for yy in range(y, y + h) for xx in range(x, x + w)): continue
+        if any(near_road(x, y, w, h) for (x, y, mx, my) in coords4(tx, ty, w, h)): continue
         if place(nm, tx, ty, solid_rows, margin=margin, req=False): done += 1
     return done
 def mrun_h(names, x0, x1, y, **kw):
@@ -396,15 +416,57 @@ for b in bases:
                 if ing(x + dx, y + dy): protect[y + dy][x + dx] = True
 
 
-def pn(name, x, y, solid_rows=1, foot=None, margin=0, ondirt=False, onwater=False, radius=5, **kw):
+def pn(name, x, y, solid_rows=1, foot=None, margin=0, ondirt=False, onwater=False, radius=5, low=False, **kw):
     """place near (x,y): spiral outwards until a mirrored-4 spot is free (keeps the district roughly where authored)"""
     cand = sorted(((dx * dx + dy * dy, dx, dy) for dx in range(-radius, radius + 1) for dy in range(-radius, radius + 1)))
     for _, dx, dy in cand:
-        if place(name, x + dx, y + dy, solid_rows, foot, margin, ondirt, onwater, req=False): return True
+        if place(name, x + dx, y + dy, solid_rows, foot, margin, ondirt, onwater, req=False, low=low): return True
     print("WARN no spot:", name, x, y); return False
+import os
+
+# ----------------------------------------------------------------- 4b. secret hedge sites (reserved BEFORE the structures so nothing crowds them)
+SEC_L, SEC_W = 6, 2                 # hidden corridor length, alcove depth at each end
+def site_cells(x, y, horiz, L=SEC_L, w=SEC_W):
+    """block = 3 rows x (L+2w); corridor = the middle row between the alcoves.  Returns walls, corridor, alcoves, a, b, ring"""
+    n = L + 2 * w
+    def P(i, k): return (x + i, y + k) if horiz else (x + k, y + i)
+    walls = [P(i, k) for i in range(n) for k in (-1, 1)]
+    cor = [P(w + i, 0) for i in range(L)]
+    alc = [P(i, 0) for i in range(w)] + [P(n - 1 - i, 0) for i in range(w)]
+    a, b = P(w - 1, 0), P(w + L, 0)           # alcove back cells: the two entrance tiles of the passage
+    ring = [P(i, k) for i in range(-1, n + 1) for k in (-2, 2)] + [P(-1, k) for k in (-1, 0, 1)] + [P(n, k) for k in (-1, 0, 1)]
+    return walls, cor, alc, a, b, ring
+def mirrors(x, y): return {(x, y), (W - 1 - x, y), (x, H - 1 - y), (W - 1 - x, H - 1 - y)}
+def far_from_goals(cells, dmin=8):
+    for (x, y) in cells:
+        for (px, py) in mirrors(x, y):
+            for bb in bases:
+                for (gx, gy) in ((bb["tx"], bb["ty"]), (bb["sx"], bb["sy"])):
+                    if max(abs(px - gx), abs(py - gy)) < dmin: return False
+    return True
+def site_free(x, y, horiz, L=SEC_L, w=SEC_W):
+    walls, cor, alc, a, b, ring = site_cells(x, y, horiz, L, w)
+    allc = walls + cor + alc
+    if any(not (3 <= cx < QW - 1 and 3 <= cy < QH - 1) for (cx, cy) in allc + ring): return False
+    for (cx, cy) in allc:
+        if occupied[cy][cx] or solid[cy][cx] or dirt[cy][cx] or protect[cy][cx] or wet(cx, cy) or bridge[cy][cx] or stones[cy][cx]: return False
+    for (cx, cy) in ring:
+        if occupied[cy][cx] or solid[cy][cx] or wet(cx, cy) or bridge[cy][cx]: return False
+    return far_from_goals(allc)
+SITES = [(True, 10, 23), (True, 23, 12)]
+for (hz, sx_, sy_) in ([] if os.environ.get('SEARCH') else SITES):
+    assert site_free(sx_, sy_, hz), ("secret site no longer free", hz, sx_, sy_)
+    _w, _c, _al, _a, _b, _r = site_cells(sx_, sy_, hz)
+    for (cx, cy) in _w + _c + _al + _r:
+        for (mx_, my_) in mirrors(cx, cy): occupied[my_][mx_] = True
+if os.environ.get("SEARCH"):
+    for hz in (True, False):
+        c = [(x, y) for x in range(3, QW - 1) for y in range(3, QH - 1) if site_free(x, y, hz)]
+        print("SITES", "H" if hz else "V", len(c), c)
+
 # ----------------------------------------------------------------- 5. structures
 FW = ["fence_w", "fence_w2"]; WS = ["wall_s", "wall_s2"]
-TORII = [(0, 0, 1, 2), (2, 0, 1, 2)]
+TORII = [(0, 1, 1, 1), (2, 1, 1, 1)]   # only the pillar bases are solid (the beam above is walk-behind)
 HOUSES = ["hut_a", "hut_b", "hut_c", "house_stone", "house_dark", "house_orange", "hut_wood", "shop", "dojo"]
 
 # --- village around the avenue / ring road: houses frontage-placed along the road centre lines
@@ -434,21 +496,21 @@ def cluster(zone, names, count, near=2, solid_rows=2, margin=1, tries=4000):
         if not any(dirt[min(H - 1, ty + h + d)][xx] for d in range(0, near + 1) for xx in range(tx, tx + w)): continue
         if place(nm, tx, ty, solid_rows, margin=margin, req=False): done += 1
     return done
-cluster((16, 13, 31, 23), HOUSES, 9, 2)
+cluster((16, 13, 31, 23), HOUSES, 7, 2)
 cluster((3, 12, 14, 20), HOUSES[:6], 2, 3)
 # market square: stalls with produce crates, a well, banners
 for nm, x, y in [("awning_a", 21, 18), ("awning_b", 23, 18)]: pn(nm, x, y, 0, foot=[(0, 1, 3, 1)], margin=0, ondirt=True)
 for nm, x, y in [("basket_fish", 21, 19), ("basket_veg", 22, 19), ("crate_a", 23, 19), ("crate_c", 24, 19), ("barrel_a", 25, 18), ("jar_b", 20, 18)]:
-    pn(nm, x, y, 1, ondirt=True)
+    pn(nm, x, y, 1, ondirt=True, low=nm.startswith(("crate", "basket")))
 pn("dsrt_well", 21, 21, 1, ondirt=True)
 for nm, x, y in [("banner_c0", 20, 15), ("banner_c3", 24, 15), ("sign_a", 18, 16), ("el_barrel", 26, 19), ("el_crate", 18, 21)]:
-    pn(nm, x, y, 1 if SPR[nm][4] == 1 else 0, ondirt=True)
+    pn(nm, x, y, 1 if SPR[nm][4] == 1 else 0, ondirt=True, low=nm == "el_crate")
 for nm, x, y in [("cart_a", 15, 14), ("el_barrel", 16, 14)]: pn(nm, x, y, 1, ondirt=True)
 
 # --- ruined courtyard / graveyard (walls with gates), south of the plaza, west of the village (gates at N and S)
-mrun_h(WS, 10, 11, 14); mrun_h(WS, 13, 14, 14)                    # north wall with a gate at x=12
-mrun_h(WS, 10, 11, 19); mrun_h(WS, 13, 14, 19)
-mrun_v("post_s", 10, 15, 18); mrun_v("post_s", 14, 15, 18)
+mrun_h(WS, 10, 11, 14, low=True); mrun_h(WS, 13, 14, 14, low=True)                    # north wall with a gate at x=12
+mrun_h(WS, 10, 11, 19, low=True); mrun_h(WS, 13, 14, 19, low=True)
+mrun_v("post_s", 10, 15, 18, low=True); mrun_v("post_s", 14, 15, 18, low=True)
 for nm, x, y in [("grave_cross", 11, 15), ("grave_stone", 13, 15), ("grave_pillar", 12, 17), ("grave_cross", 11, 18)]:
     pn(nm, x, y, 1)
 pn("mstatue_knight", 12, 15, 1) if False else None
@@ -477,7 +539,7 @@ pn("firepit", 19, 14, 1, margin=0); pn("cauldron", 24, 10, 1); pn("camp_table", 
 # --- desert settlement (sand): domes, L-houses, palms, stalls, well, towers
 pn("dsrt_house", 27, 3, 2, margin=1); pn("dsrt_L2", 31, 2, foot=[(0, 2, 4, 2)], margin=1)
 pn("dsrt_dome", 26, 9, 2, margin=1); pn("dsrt_tower", 38, 8, 2, margin=1)
-pn("palm_pair", 29, 9, foot=[(0, 2, 4, 1)], margin=0); pn("dsrt_well", 33, 6, 1); pn("dsrt_lion", 30, 12, 1)
+pn("palm_pair", 29, 9, foot=[(1, 2, 2, 1)], margin=0); pn("dsrt_well", 33, 6, 1); pn("dsrt_lion", 30, 12, 1)
 pn("dsrt_stall", 35, 11, 1); pn("dsrt_stall2", 37, 4, 1); pn("tower_sand", 24, 3, 1)
 pn("dsrt_bath", 36, 13, 1)
 
@@ -502,26 +564,178 @@ pn("lodge", 4, 22, foot=[(0, 3, 4, 2)], margin=1); pn("tower_wood", 5, 18, 1)
 for nm, x, y, sr in [("statue_orb", 37, 27, 1), ("el_chest", 39, 29, 1), ("pillar", 38, 27, 1)]: pn(nm, x, y, sr, margin=0)
 
 # --- fences around the village + paddocks
-mrun_h(FW, 14, 17, 22); mrun_h(FW, 27, 30, 18)
-for nm, x, y in [("hay_bale", 28, 23), ("hay_tuft", 29, 23)]: pn(nm, x, y, 1)
+mrun_h(FW, 14, 17, 22, low=True); mrun_h(FW, 27, 30, 18, low=True)
+for nm, x, y in [("hay_bale", 28, 23), ("hay_tuft", 29, 23)]: pn(nm, x, y, 1, low=True)
 
 # ----------------------------------------------------------------- 6. natural cover
 GRASS = ["tree_olive_a", "tree_pine", "tree_olive_b", "tree_olive_c", "grove_olive", "grove_pine", "bigtree_green", "bigtree_autumn", "grove_olive2", "tree_round"]
-grove(8.0, 21.0, 2.6, GRASS, 9); grove(4.0, 8.0, 1.8, GRASS, 6); grove(23.5, 11.5, 2.5, GRASS, 6)
-grove(28.0, 28.0, 2.2, ["tree_dead", "grove_dead", "tree_roots", "stump_a", "stump_b"], 5)
-grove(14.0, 7.0, 2.4, GRASS, 6)
-scatter((3, 13, 39, 29), GRASS, 55, 1, 1)
-scatter((16, 12, 39, 22), ["rocks_brown", "rocks_grey", "rock_brown", "rock_grey", "stump_a", "pebble_tan_a", "pebble_grey_a"], 14, 1, 1)
-scatter((24, 3, 39, 14), ["rock_brown", "rocks_brown", "tree_dead", "stump_b", "pebble_tan_b"], 8, 1, 1, biomes=(1,))
-scatter((24, 3, 39, 14), ["palm_pair", "tree_dead", "bigtree_autumn", "rock_brown"], 5, 1, 0, biomes=(1,))
-scatter((9, 19, 20, 29), ["tree_snow_a", "tree_snow_b", "tree_white", "grove_snow", "bigtree_white", "boulder_snow"], 14, 1, 1, biomes=(2,))
-scatter((14, 20, 32, 29), ["tree_dead", "grove_dead", "tree_roots", "stump_a", "stump_b", "vtree_small", "vtree_small2"], 8, 1, 1)
-scatter((3, 3, 39, 29), ["berry_a", "berry_b", "berry_c", "berry_d", "berry_e", "berry_f", "berry_g", "bush_a", "bush_b", "bush_c", "bush_d"], 90, 1, 2)
-scatter((3, 3, 39, 29), ["bush_f", "bush_e", "berry_big_a", "berry_big_b", "berry_big_c", "berry_big_d"], 30, 1, 1)
+grove(8.0, 21.0, 2.6, GRASS, 4); grove(4.0, 8.0, 1.8, GRASS, 3); grove(23.5, 11.5, 2.5, GRASS, 3)
+grove(28.0, 28.0, 2.2, ["tree_dead", "grove_dead", "tree_roots", "stump_a", "stump_b"], 2)
+grove(14.0, 7.0, 2.4, GRASS, 3)
+scatter((3, 13, 39, 29), GRASS, 11, 1, 3)
+scatter((16, 12, 39, 22), ["rocks_brown", "rocks_grey", "rock_brown", "rock_grey", "stump_a", "pebble_tan_a", "pebble_grey_a"], 4, 1, 3)
+scatter((24, 3, 39, 14), ["rock_brown", "rocks_brown", "tree_dead", "stump_b", "pebble_tan_b"], 3, 1, 3, biomes=(1,))
+scatter((24, 3, 39, 14), ["palm_pair", "tree_dead", "bigtree_autumn", "rock_brown"], 3, 1, 1, biomes=(1,))
+scatter((9, 19, 20, 29), ["tree_snow_a", "tree_snow_b", "tree_white", "grove_snow", "bigtree_white", "boulder_snow"], 5, 1, 3, biomes=(2,))
+scatter((14, 20, 32, 29), ["tree_dead", "grove_dead", "tree_roots", "stump_a", "stump_b", "vtree_small", "vtree_small2"], 3, 1, 3)
+scatter((3, 3, 39, 29), ["berry_a", "berry_b", "berry_c", "berry_d", "berry_e", "berry_f", "berry_g", "bush_a", "bush_b", "bush_c", "bush_d"], 11, 1, 4)
+scatter((3, 3, 39, 29), ["bush_f", "bush_e", "berry_big_a", "berry_big_b", "berry_big_c", "berry_big_d"], 4, 1, 4)
 
 # ----------------------------------------------------------------- 7. decoration (non-solid overlay)
 GR_TUFT = ["tuft_a", "tuft_b", "tuft_c", "tuft_d", "leaf_a", "leaf_b", "fern_a", "fern_b", "tallgrass", "tallgrass"]
 GR_FLOW = ["flower_sun", "flower_sun2", "flower_clover", "flower_red", "flower_white", "flower_white", "flower_red"]
+# ----------------------------------------------------------------- 6a. creeks (leapable water strips) + bridges
+rng2 = random.Random(4242)                    # separate stream: later passes do not disturb the earlier map
+def mir4(cells):
+    out = set()
+    for (x, y) in cells: out |= {(x, y), (W - 1 - x, y), (x, H - 1 - y), (W - 1 - x, H - 1 - y)}
+    return out
+def clear_objects(cells):
+    """remove every placed (grouped) object whose sprite rectangle touches `cells` (whole mirrored sets)"""
+    cs = set(cells); hit = set()
+    for i, o in enumerate(objects):
+        g = obj_meta[i][0]
+        if g and any((x, y) in cs for y in range(o[2], o[2] + o[4]) for x in range(o[1], o[1] + o[3])): hit.add(g)
+    gone = set(i for i, m in enumerate(obj_meta) if m[0] in hit)
+    for i in gone:
+        for (x, y) in _own_cells_g(i):
+            if ing(x, y) and solid[y][x] in (1, 3): solid[y][x] = 0
+        o = objects[i]
+        for yy in range(o[2], o[2] + o[4]):
+            for xx in range(o[1], o[1] + o[3]):
+                if ing(xx, yy): occupied[yy][xx] = False
+    objects[:] = [o for i, o in enumerate(objects) if i not in gone]
+    obj_meta[:] = [m for i, m in enumerate(obj_meta) if i not in gone]
+    return len(gone)
+def _own_cells_g(i):
+    name, tx, ty = objects[i][0], objects[i][1], objects[i][2]
+    return [(xx, yy) for (dx, dy, fw, fh) in obj_meta[i][1] for yy in range(ty + dy, ty + dy + fh) for xx in range(tx + dx, tx + dx + fw)]
+CREEK_CELLS = set(); BRIDGE_CELLS = set(); STUB_CELLS = set(); STONE_CELLS = set()
+creek_info = []
+def carve_creek(name, local, bridge_local=(), stub_local=(), stone_local=()):
+    cells = mir4(local); br = mir4(bridge_local); st = mir4(stub_local); sto = mir4(stone_local)
+    n = clear_objects(cells | br | st | set((x + dx, y + dy) for (x, y) in br | st for dx in (-1, 0, 1) for dy in (-1, 0, 1)))
+    for (x, y) in cells:
+        assert 2 <= x < W - 2 and 2 <= y < H - 2, (name, x, y)
+        water[y][x] = True; island[y][x] = False
+        dirt[y][x] = sand[y][x] = snow[y][x] = swamp[y][x] = ice[y][x] = False
+        solid[y][x] = 2; overlay[y][x] = NONE; occupied[y][x] = True; biome[y][x] = 0; bridge[y][x] = False
+    for (x, y) in br | st:
+        dirt[y][x] = False; sand[y][x] = False; snow[y][x] = False; biome[y][x] = 0
+        solid[y][x] = 0; occupied[y][x] = True; protect[y][x] = True
+    CREEK_CELLS.update(cells); BRIDGE_CELLS.update(br); STUB_CELLS.update(st); STONE_CELLS.update(sto)
+    creek_info.append((name, len(cells) // 4 if False else len(cells), n))
+def plank(x, y): overlay[y][x] = enc("Water", 1, 13)
+# CK_N: "river" along the vertical seam (x=39|40) from the north border down to the lake (and mirrored south): 2 tiles wide
+col = []
+y = 2
+while y < QH and not (water[y][39] and not island[y][39]): col.append((39, y)); y += 1
+CK_N_END = y
+carve_creek("seam river", col,
+            bridge_local=[(38, 3), (39, 3)] if (39, 3) in set(col) else [],      # the plank bridge (walkable, 1 tile wide)
+            stub_local=[(38, 12)],                                                # broken bridge: plank stubs on both banks only
+            stone_local=[(39, 15), (39, 17)])
+# CK_W: 3-wide creek stub from the west border (rows 24..26), ends in a small pool, 1-tile bridge near the border
+carve_creek("west creek", [(x, yy) for x in range(2, 6) for yy in (17, 18, 19)] + [],
+            bridge_local=[(3, yy) for yy in range(16, 21)])
+# retile everything around the new water
+_ch = set()
+for (x, y) in CREEK_CELLS | BRIDGE_CELLS | STUB_CELLS:
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            if ing(x + dx, y + dy): _ch.add((x + dx, y + dy))
+for (x, y) in _ch:
+    if water[y][x]: ground[y][x] = put("water", water, x, y)
+    elif dirt[y][x]: ground[y][x] = put("dirt", dirt, x, y)
+    elif sand[y][x]: ground[y][x] = put("sand", sand, x, y)
+    elif snow[y][x]: ground[y][x] = put("snow", snow, x, y)
+    elif (x, y) in BRIDGE_CELLS or (x, y) in STUB_CELLS:
+        pass
+for (x, y) in BRIDGE_CELLS | STUB_CELLS:
+    if ground[y][x] >> 12 != 1: ground[y][x] = enc("Floor", 0, 12)
+    plank(x, y)
+for (x, y) in STONE_CELLS: overlay[y][x] = enc("Water", 12, 0)
+print("creeks:", creek_info, "seam river ends at y", CK_N_END)
+
+import os
+if os.environ.get("DUMPQ"):
+    print("    " + "".join(str(x % 10) for x in range(QW)))
+    for y in range(QH):
+        print(f"{y:3d} " + "".join('#' if solid[y][x] == 1 else '~' if solid[y][x] == 2 else 'L' if solid[y][x] == 3 else ':' if dirt[y][x] else 'o' if occupied[y][x] else 's' if biome[y][x] == 1 else 'n' if biome[y][x] == 2 else 'p' if protect[y][x] else '.' for x in range(QW)))
+# ----------------------------------------------------------------- 6b. declutter: no pinched paths
+# Small solid props (bushes, crates, barrels, stumps, small rocks...) that sit within one free tile of any other solid
+# (object, wall or water) are removed, whole mirrored sets at once so the map stays symmetric.
+PRUNE_PFX = ("bush", "berry", "plant", "pebble", "crate", "barrel", "jar", "basket", "stump", "hay", "el_", "rock_",
+             "sign", "bench", "camp_", "cart", "snowbush", "snowrock", "cauldron")
+def _own_cells(i):
+    name, tx, ty = objects[i][0], objects[i][1], objects[i][2]
+    cells = set()
+    for (dx, dy, fw, fh) in obj_meta[i][1]:
+        for yy in range(ty + dy, ty + dy + fh):
+            for xx in range(tx + dx, tx + dx + fw): cells.add((xx, yy))
+    return cells
+def _tight(i):
+    own = _own_cells(i)
+    for (x, y) in own:
+        for yy in range(y - 2, y + 3):
+            for xx in range(x - 2, x + 3):
+                if (xx, yy) in own or not ing(xx, yy): continue
+                if solid[yy][xx]: return True
+    return False
+_groups = {}
+for i, m in enumerate(obj_meta):
+    if m[0]: _groups.setdefault(m[0], []).append(i)
+_removed = set()
+for g in sorted(_groups):
+    idxs = _groups[g]
+    if any(not (SPR[objects[i][0]][3] * SPR[objects[i][0]][4] <= 2 and objects[i][0].startswith(PRUNE_PFX)) for i in idxs): continue
+    if any(_tight(i) for i in idxs):
+        for i in idxs:
+            for (x, y) in _own_cells(i):
+                if ing(x, y): solid[y][x] = 0
+            name, tx, ty, w, h = objects[i][:5]
+            for yy in range(ty, ty + h):
+                for xx in range(tx, tx + w):
+                    if ing(xx, yy): occupied[yy][xx] = False
+            _removed.add(i)
+objects[:] = [o for i, o in enumerate(objects) if i not in _removed]
+obj_meta[:] = [m for i, m in enumerate(obj_meta) if i not in _removed]
+print("declutter: removed", len(_removed), "tightly packed props")
+
+
+# ----------------------------------------------------------------- 6c. secret hedge corridors
+HEDGE = {0: ["bush_a", "bush_b", "bush_f", "bush_b"], 1: ["berry_d", "berry_e"], 2: ["snowbush_a", "snowbush_b"]}
+TELL = {0: ["fern_a", "fern_b", "tuft_a"], 1: ["dry_a", "dry_d"], 2: ["snowbush_b"]}
+secret_objs = []; passages = []; tells = []
+def hedge_sprite(x, y, bm):
+    cx, cy = min(x, W - 1 - x), min(y, H - 1 - y)            # canonical (mirror-invariant) cell -> mirrored copies look identical
+    return random.Random(cx * 1000 + cy * 7 + bm).choice(HEDGE[bm])
+pid = 0
+for (hz, sx_, sy_) in SITES:
+    walls, cor, alc, a, b, ring = site_cells(sx_, sy_, hz)
+    bm = biome[a[1]][a[0]]
+    seen_sites = set()
+    for (mx, my) in ((False, False), (True, False), (False, True), (True, True)):
+        T = lambda c: (W - 1 - c[0] if mx else c[0], H - 1 - c[1] if my else c[1])
+        key = tuple(sorted(T(c) for c in cor))
+        if key in seen_sites: continue
+        seen_sites.add(key); pid += 1
+        for c in walls:
+            x, y = T(c); assert not solid[y][x] and not SECRET_GRID[y][x], (x, y)
+            n = hedge_sprite(x, y, bm); sheet, cc, rr, w_, h_ = SPR[n]
+            objects.append((n, x, y, 1, 1, sheet, cc, rr)); obj_meta.append((0, [(0, 0, 1, 1)])); solid[y][x] = 1; occupied[y][x] = True
+        for c in cor:
+            x, y = T(c); assert not solid[y][x]
+            SECRET_GRID[y][x] = pid
+            n = hedge_sprite(x, y, bm); sheet, cc, rr, w_, h_ = SPR[n]
+            secret_objs.append((SI[sheet], cc, rr, 1, 1, x, y))
+        for c in alc:
+            x, y = T(c); assert not solid[y][x]; occupied[y][x] = True
+        ax, ay = T(a); bx, by = T(b)
+        passages.append((ax, ay, bx, by, pid))
+        tells.append((T(a), T(b), bm))
+print("secret passages:", passages)
+
 GR_BUSH = ["bush_a", "bush_b", "bush_c", "bush_d", "bush_e", "bush_f", "plant_a", "plant_b"]
 SAND = ["dry_a", "dry_b", "dry_c", "dry_d", "dry_a", "dry_c"]
 SNOW = ["snowbush_a", "snowbush_b", "snowrock", "snowrock2"]
@@ -537,10 +751,10 @@ def dpick(x, y):
     if near_water(x, y) and rnd.random() < 0.6: return rnd.choice(["reed_a", "reed_b", "reed_a"])
     r = rnd.random()
     return rnd.choice(GR_BUSH if r < 0.30 else GR_FLOW if r < 0.55 else GR_TUFT)
-for _ in range(700):
+for _ in range(260):
     x, y = rnd.randrange(2, QW), rnd.randrange(2, QH)
     if plain(x, y) and (biome[y][x] == 0 or rnd.random() < 0.3): dec[(x, y)] = dpick(x, y)
-for _ in range(110):
+for _ in range(35):
     cx, cy = rnd.randrange(3, QW), rnd.randrange(3, QH)
     if biome[cy][cx] != 0: continue
     kind = rnd.choice(["flow", "bush", "mix", "mix"])
@@ -575,6 +789,13 @@ for (x, y), code in lil.items():
     for (xx, yy) in {(x, y), (W - 1 - x, y), (x, H - 1 - y), (W - 1 - x, H - 1 - y)}:
         if overlay[yy][xx] == NONE and water[yy][xx] and not occupied[yy][xx]: overlay[yy][xx] = code
 
+# entrance 'tells': a fern / tuft on the alcove back tile in front of the hidden corridor
+for (ta, tb, bm) in tells:
+    for (x, y) in (ta, tb):
+        sheet, c, r, w_, h_ = SPR[TELL[bm][(x * 3 + y) % len(TELL[bm])]]
+        if bm == 2 and False: continue
+        overlay[y][x] = enc(sheet, c, r)
+
 # ----------------------------------------------------------------- 8. validation: reachability + pocket removal
 def flood(sx, sy):
     seen = {(sx, sy)}; q = deque(seen)
@@ -601,7 +822,12 @@ for y in range(H):
             if len(comp) > 12:
                 raise SystemExit(f"disconnected walkable pocket of {len(comp)} tiles at {x},{y}")
             print("  sealed pocket", len(comp), sorted(comp)[:3])
-            for (cx, cy) in comp: solid[cy][cx] = 1
+            for (cx, cy) in comp:
+                if (ground[cy][cx] >> 12) == SI["Water"]:      # sealed bit of pond: plain water, no dead-end planks/stones drawn on it
+                    solid[cy][cx] = 2
+                else:
+                    solid[cy][cx] = 1
+                if overlay[cy][cx] != NONE and (overlay[cy][cx] >> 12) == SI["Water"]: overlay[cy][cx] = NONE   # no dead-end planks/stones
             pockets += 1
 # keep solid exactly mirror symmetric (objects are placed with mirrored copies; assert it)
 for y in range(H):
@@ -612,6 +838,69 @@ asym = sum(1 for y in range(H) for x in range(W) if solid[y][x] != solid[H - 1 -
 walk = sum(1 for y in range(H) for x in range(W) if not solid[y][x])
 print(f"reachability OK; walkable {walk} / {W*H}, sealed pockets {pockets}, 180deg-asymmetric cells {asym}")
 
+import heapq
+def route_cost(src, dst, leap=True, secret=False, maxd=4):
+    """Dijkstra in tiles (4-neighbour walking = 1/tile; leap edge over water/low cells up to maxd tiles = d). secret cells walkable only if secret=True"""
+    sec = SECRET_GRID
+    def walk(x, y): return ing(x, y) and solid[y][x] == 0 and (secret or not sec[y][x])
+    dist = {src: 0}; pq = [(0, src)]
+    while pq:
+        dcur, (x, y) = heapq.heappop(pq)
+        if (x, y) == dst: return dcur
+        if dcur > dist.get((x, y), 1e9): continue
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = x + dx, y + dy
+            if walk(nx, ny):
+                nd = dcur + 1
+                if nd < dist.get((nx, ny), 1e9): dist[(nx, ny)] = nd; heapq.heappush(pq, (nd, (nx, ny)))
+            elif leap and ing(nx, ny) and solid[ny][nx] in (2, 3):
+                for d in range(2, maxd + 1):
+                    lx, ly = x + dx * d, y + dy * d
+                    if not ing(lx, ly): break
+                    if solid[ly][lx] == 1: break
+                    if any(solid[y + dy * k][x + dx * k] == 1 for k in range(1, d)): break
+                    if walk(lx, ly):
+                        nd = dcur + d
+                        if nd < dist.get((lx, ly), 1e9): dist[(lx, ly)] = nd; heapq.heappush(pq, (nd, (lx, ly)))
+    return None
+for _a, _b in ((0, 1), (0, 2), (1, 3), (2, 3), (0, 3)):
+    _s = (bases[_a]['sx'], bases[_a]['sy']); _t = (bases[_b]['tx'], bases[_b]['ty'])
+    _w = route_cost(_s, _t, False); _l = route_cost(_s, _t, True)
+    print(f"route {_a}->{_b}: walk {_w} leap {_l} shortening {100*(_w-_l)/_w:.1f}%")
+# ---- secret / low asserts
+for y in range(H):
+    for x in range(W):
+        for (ox, oy) in ((W - 1 - x, y), (x, H - 1 - y), (W - 1 - x, H - 1 - y)):
+            assert SECRET_GRID[y][x] == SECRET_GRID[oy][ox] or (SECRET_GRID[y][x] and SECRET_GRID[oy][ox]), ("SECRET asym", x, y)
+            assert (SECRET_GRID[y][x] > 0) == (SECRET_GRID[oy][ox] > 0), ("SECRET asym", x, y)
+            assert solid[y][x] == solid[oy][ox], ("SOLID asym", x, y, solid[y][x], solid[oy][ox])
+def flood_ns(sx, sy):
+    seen = {(sx, sy)}; q = deque(seen)
+    while q:
+        x, y = q.popleft()
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            n = (x + dx, y + dy)
+            if n not in seen and ing(*n) and not solid[n[1]][n[0]] and not SECRET_GRID[n[1]][n[0]]: seen.add(n); q.append(n)
+    return seen
+reach_ns = flood_ns(bases[0]["sx"], bases[0]["sy"])
+for b in bases:
+    assert (b["sx"], b["sy"]) in reach_ns and (b["tx"], b["ty"]) in reach_ns, "bases disconnected without secrets"
+for (ax, ay, bx, by, i) in passages:
+    assert (ax, ay) in reach_ns and (bx, by) in reach_ns, ("passage end not connected", i)
+    d = route_cost((ax, ay), (bx, by), False, False)
+    ln = sum(1 for yy in range(H) for xx in range(W) if SECRET_GRID[yy][xx] == i)
+    assert d is not None and d / (ln + 1) >= 2.5, ("detour ratio", i, d, ln)
+    for bb in bases:
+        for g in ((bb["tx"], bb["ty"]), (bb["sx"], bb["sy"])):
+            for (cx, cy) in ((ax, ay), (bx, by)): assert max(abs(cx - g[0]), abs(cy - g[1])) >= 8
+nlow = sum(1 for y in range(H) for x in range(W) if solid[y][x] == 3)
+print(f"secret: {len(passages)} passages, {sum(1 for r in SECRET_GRID for v in r if v)} secret cells; low (SOLID==3) cells {nlow}")
+_pairs = {}
+for _a, _b in ((0, 1), (0, 2), (1, 3), (2, 3)):
+    _s = (bases[_a]['sx'], bases[_a]['sy']); _t = (bases[_b]['tx'], bases[_b]['ty'])
+    _w = route_cost(_s, _t, False); _l = route_cost(_s, _t, True); _pairs[(_a, _b)] = (_w - _l) / _w
+assert abs(_pairs[(0, 1)] - _pairs[(2, 3)]) < 1e-9 and abs(_pairs[(0, 2)] - _pairs[(1, 3)]) < 1e-9, _pairs
+assert max(_pairs.values()) >= 0.15, ("leap shortening too small", _pairs)
 # ----------------------------------------------------------------- 9. export
 objects.sort(key=lambda o: (o[2] + o[4], o[1]))
 def arr(name, typ, data, per=W):
@@ -638,7 +927,19 @@ out += ["};", "", "struct Flag { int16_t tx, ty; uint8_t team; };",
 out += [f"  {{{x},{y},{t}}}," for x, y, t in flags]
 out += ["};", "", "struct Base { int cx, cy, cw, ch, tx, ty, sx, sy; };", "inline constexpr Base BASES[4] = {"]
 out += [f"  {{{b['cx']},{b['cy']},{b['cw']},{b['ch']},{b['tx']},{b['ty']},{b['sx']},{b['sy']}}}," for b in bases]
-out += ["};", "} // namespace world", ""]
+out += ["};", "",
+        "// ---- secret passages / portals (walkable hidden hedge corridors; see docs) ----",
+        arr("SECRET", "uint8_t", [v for r in SECRET_GRID for v in r]),
+        f"inline constexpr int NUM_SECRET_OBJS = {len(secret_objs)};",
+        "inline constexpr Obj SECRET_OBJS[NUM_SECRET_OBJS] = {   // 1x1 bush sprites drawn IN FRONT of players"] + [f"  {{{sh},{c},{r},{w_},{h_},{x},{y}}}," for (sh, c, r, w_, h_, x, y) in secret_objs] + ["};",
+        "struct Passage { int16_t ax, ay, bx, by; uint8_t id; };",
+        f"inline constexpr int NUM_PASSAGES = {len(passages)};",
+        "inline constexpr Passage PASSAGES[NUM_PASSAGES] = {"] + [f"  {{{ax},{ay},{bx},{by},{i}}}," for (ax, ay, bx, by, i) in passages] + ["};",
+        
+        "struct Portal { int16_t ax, ay, bx, by; };",
+        "inline constexpr int NUM_PORTALS = 0;",
+        "inline constexpr Portal PORTALS[1] = { {0,0,0,0} };",
+        "} // namespace world", ""]
 open("src/game/WorldMap.hpp", "w").write("\n".join(out))
 
 # ----------------------------------------------------------------- 10. python preview (same data the client draws)
@@ -660,6 +961,8 @@ for _, k, o in sorted(items, key=lambda t: (t[0], t[1])):
         img.alpha_composite(sheets[SI[sh]].crop((c * 16, r * 16, (c + w) * 16, (r + h) * 16)), (tx * 16, ty * 16))
     else:
         img.alpha_composite(FL[o[2]].crop((0, 0, 16, 16)), (o[0] * 16, o[1] * 16))
+for (sh, c, r, w_, h_, x, y) in secret_objs:       # the client draws these in front of players
+    img.alpha_composite(sheets[sh].crop((c * 16, r * 16, (c + 1) * 16, (r + 1) * 16)), (x * 16, y * 16))
 tre = Image.open(R + "Items/Treasure/GoldCup.png").convert("RGBA")
 for b in bases: img.alpha_composite(tre, (b["tx"] * 16 + 3, b["ty"] * 16 + 2))
 if len(sys.argv) > 1:

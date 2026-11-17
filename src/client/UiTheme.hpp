@@ -64,14 +64,14 @@ inline std::string spaced(const std::string& s, unsigned size) {
     return out;
 }
 
-inline float textWidth(const sf::Font& f, unsigned size, const std::string& s) {
-    sf::Text t(f, spaced(s, size), size);
+inline float textWidth(const sf::Font& f, unsigned size, const std::string& s, bool pixelFont = true) {
+    sf::Text t(f, pixelFont ? spaced(s, size) : s, size);
     return t.getLocalBounds().size.x + t.getLocalBounds().position.x;
 }
 
 // Greedy word wrap; the first line is allowed `firstIndent` fewer pixels.
 inline std::vector<std::string> wrapText(const sf::Font& f, unsigned size, const std::string& s,
-                                         float maxW, float firstIndent = 0.f) {
+                                         float maxW, float firstIndent = 0.f, bool pixelFont = true) {
     std::vector<std::string> lines;
     std::string cur;
     float avail = maxW - firstIndent;
@@ -81,12 +81,12 @@ inline std::vector<std::string> wrapText(const sf::Font& f, unsigned size, const
         std::string word = s.substr(i, j == std::string::npos ? std::string::npos : j - i);
         i = (j == std::string::npos) ? s.size() : j + 1;
         std::string trial = cur.empty() ? word : cur + " " + word;
-        if (textWidth(f, size, trial) <= avail) { cur = trial; continue; }
+        if (textWidth(f, size, trial, pixelFont) <= avail) { cur = trial; continue; }
         if (!cur.empty()) { lines.push_back(cur); cur.clear(); avail = maxW; }
         // break very long words by characters
-        while (textWidth(f, size, word) > avail && word.size() > 1) {
+        while (textWidth(f, size, word, pixelFont) > avail && word.size() > 1) {
             size_t k = word.size() - 1;
-            while (k > 1 && textWidth(f, size, word.substr(0, k)) > avail) --k;
+            while (k > 1 && textWidth(f, size, word.substr(0, k), pixelFont) > avail) --k;
             lines.push_back(word.substr(0, k));
             word = word.substr(k);
             avail = maxW;

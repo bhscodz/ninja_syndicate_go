@@ -10,6 +10,7 @@
 #include <SFML/Graphics.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -20,6 +21,9 @@ constexpr float REVEAL_TILES = 12.f;                // reveal / vision radius in
 constexpr float SOFT_TILES   = 4.f;                 // width of the soft visible edge
 constexpr uint8_t DIM_ALPHA  = 80;                  // explored but not visible (light white haze)
 constexpr uint8_t DARK_ALPHA = 218;                 // never seen (white mist, terrain faintly visible)
+
+// Minimap marker for a trophy (world pixel centre). kind: 0 home cup, 1 carried (blinks, shown even in unexplored area), 2 dropped (ring)
+struct MapMarker { float x = 0, y = 0; int kind = 0; sf::Color col; };
 
 class Fog {
 public:
@@ -55,6 +59,14 @@ public:
         mmImg_ = sf::Image(sf::Vector2u(W, H), sf::Color(0, 0, 0, 0));
         mmTex_.update(mmImg_);
         dirty_ = false;
+        std::fill(discovered_.begin(), discovered_.end(), 0);
+    }
+
+    // Secret passages found by the local player (reset together with the fog at match start).
+    bool discovered(int id) const { return id > 0 && id < 256 && discovered_[id]; }
+    bool discover(int id) {   // returns true the first time
+        if (id <= 0 || id >= 256 || discovered_[id]) return false;
+        discovered_[id] = 1; return true;
     }
 
     // Is a world position inside the currently visible radius?
@@ -97,7 +109,8 @@ public:
 
     // Minimap in HUD space. pos = top-left, scale = pixels per tile.
     void drawMinimap(sf::RenderTarget& rt, sf::Vector2f pos, float scale, const sf::Color teamCol[4],
-                     sf::Vector2f playerPx, sf::Color playerCol, sf::FloatRect camRect, float time) {
+                     sf::Vector2f playerPx, sf::Color playerCol, sf::FloatRect camRect, float time,
+                     const std::vector<MapMarker>* markers = nullptr) {
         if (dirty_) { mmTex_.update(mmImg_); dirty_ = false; }
         const float w = W * scale, h = H * scale;
         sf::RectangleShape frame({ w + 6.f, h + 6.f });
@@ -128,6 +141,40 @@ public:
             m.setOutlineThickness(1.f);
             rt.draw(m);
         }
+        // discovered secret passages: entrance dots
+        for (int i = 0; i < world::NUM_PASSAGES; ++i) {
+            const auto& pa = world::PASSAGES[i];
+            if (!discovered(pa.id)) continue;
+            for (int e = 0; e < 2; ++e) {
+                sf::CircleShape d(2.f, 8);
+                d.setOrigin({ 2.f, 2.f });
+                d.setPosition({ pos.x + ((e ? pa.bx : pa.ax) + 0.5f) * scale, pos.y + ((e ? pa.by : pa.ay) + 0.5f) * scale });
+                d.setFillColor(sf::Color(120, 255, 150));
+                d.setOutlineColor(sf::Color(20, 70, 30));
+                d.setOutlineThickness(1.f);
+                rt.draw(d);
+            }
+        }
+        // trophy markers
+        if (markers) for (const auto& m : *markers) {
+            const sf::Vector2f c{ pos.x + m.x / gc::TILE * scale, pos.y + m.y / gc::TILE * scale };
+            if (m.kind == 0) {   // home cup: small square
+                sf::RectangleShape q({ 4.f, 4.f }); q.setOrigin({ 2.f, 2.f }); q.setPosition(c);
+                q.setFillColor(sf::Color(m.col.r, m.col.g, m.col.b, 230)); q.setOutlineColor(sf::Color(255, 240, 160)); q.setOutlineThickness(1.f);
+                rt.draw(q);
+            } else if (m.kind == 1) {   // carried: blinking trophy dot
+                if (std::fmod(time, 0.6f) < 0.38f) {
+                    sf::CircleShape d(5.f, 14); d.setOrigin({ 5.f, 5.f }); d.setPosition(c);
+                    d.setFillColor(m.col); d.setOutlineColor(sf::Color(255, 235, 120)); d.setOutlineThickness(2.f);
+                    rt.draw(d);
+                }
+            } else {   // dropped: ring
+                float r = 6.f + 2.f * std::sin(time * 8.f);
+                sf::CircleShape d(r, 16); d.setOrigin({ r, r }); d.setPosition(c);
+                d.setFillColor(sf::Color(m.col.r, m.col.g, m.col.b, 90)); d.setOutlineColor(m.col); d.setOutlineThickness(2.f);
+                rt.draw(d);
+            }
+        }
         // local player
         float blink = 0.6f + 0.4f * std::sin(time * 6.f);
         sf::CircleShape dot(4.f, 12);
@@ -141,6 +188,7 @@ public:
 
 private:
     std::vector<uint8_t> explored_;
+    std::array<uint8_t, 256> discovered_{};
     std::vector<uint8_t> vert_;
     std::vector<sf::Vertex> quads_;
     sf::Image mmImg_;

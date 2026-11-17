@@ -1,3 +1,9 @@
 .vscode/*
 build/*
 to_delete/*
+server_key
+known_hosts
+*.pem
+scratch_w/*
+steal-server.tar.gz
+deploy/*

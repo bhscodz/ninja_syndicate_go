@@ -30,3 +30,11 @@ if(MINGW)
     target_link_options(game_server PRIVATE -static)
     target_link_options(game_client PRIVATE -static)
 endif()
+
+# Encrypted channel (src/game/SecureChannel.hpp): X25519 + HKDF + ChaCha20-Poly1305 from SFML's bundled mbedTLS
+target_link_libraries(game_server PRIVATE mbedcrypto)
+target_link_libraries(game_client PRIVATE mbedcrypto)
+if(WIN32)
+    target_link_libraries(game_server PRIVATE bcrypt)   # BCryptGenRandom (OS CSPRNG)
+    target_link_libraries(game_client PRIVATE bcrypt)
+endif()
